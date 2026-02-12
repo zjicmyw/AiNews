@@ -1,0 +1,29 @@
+{
+  "name": "ai-news-risk-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Risk regime shift engine for crypto-focused macro/news monitoring",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js",
+    "lint": "node --check src/index.js",
+    "check:apis": "node scripts/check-apis.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs --env production",
+    "pm2:restart": "pm2 restart ai-news",
+    "pm2:stop": "pm2 stop ai-news",
+    "pm2:delete": "pm2 delete ai-news",
+    "pm2:logs": "pm2 logs ai-news --lines 200",
+    "pm2:status": "pm2 status",
+    "pm2:save": "pm2 save",
+    "pm2:startup": "pm2 startup"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "rss-parser": "^3.13.0",
+    "zod": "^3.24.1"
+  }
+}
