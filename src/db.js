@@ -90,6 +90,14 @@ export class DbClient {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS daily_reports (
+        report_date TEXT PRIMARY KEY,
+        timezone TEXT NOT NULL,
+        scheduled_time TEXT NOT NULL,
+        sent_at TEXT NOT NULL,
+        payload TEXT
+      );
+
       CREATE INDEX IF NOT EXISTS idx_events_ingest_time ON events(ingest_time);
       CREATE INDEX IF NOT EXISTS idx_push_logs_pushed_at ON push_logs(pushed_at);
       CREATE INDEX IF NOT EXISTS idx_push_logs_dedup_key ON push_logs(dedup_key);
@@ -336,5 +344,118 @@ export class DbClient {
          ON CONFLICT(user_id) DO UPDATE SET since_id=excluded.since_id, updated_at=excluded.updated_at`
       )
       .run(userId, sinceId, new Date().toISOString());
+  }
+
+  hasDailyReportSent(reportDate) {
+    if (!reportDate) return false;
+    const row = this.db.prepare(`SELECT report_date FROM daily_reports WHERE report_date = ? LIMIT 1`).get(reportDate);
+    return Boolean(row?.report_date);
+  }
+
+  saveDailyReport({ reportDate, timezone, scheduledTime, payload }) {
+    if (!reportDate) return;
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO daily_reports (report_date, timezone, scheduled_time, sent_at, payload)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(
+        reportDate,
+        timezone || "Asia/Shanghai",
+        scheduledTime || "16:32",
+        new Date().toISOString(),
+        JSON.stringify(payload || {})
+      );
+  }
+
+  getDailyReportSummary(startIso, endIso) {
+    const stats = this.db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM events WHERE ingest_time >= ? AND ingest_time < ?) AS total_events,
+           (SELECT COUNT(*) FROM scores WHERE analyzed_at >= ? AND analyzed_at < ?) AS scored_events,
+           (SELECT COUNT(*) FROM push_logs WHERE push_flag = 1 AND pushed_at >= ? AND pushed_at < ?) AS pushed_ok
+        `
+      )
+      .get(startIso, endIso, startIso, endIso, startIso, endIso);
+
+    const bins = this.db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN risk_score >= 0 AND risk_score < 20 THEN 1 ELSE 0 END) AS b0_20,
+           SUM(CASE WHEN risk_score >= 20 AND risk_score < 40 THEN 1 ELSE 0 END) AS b20_40,
+           SUM(CASE WHEN risk_score >= 40 AND risk_score < 50 THEN 1 ELSE 0 END) AS b40_50,
+           SUM(CASE WHEN risk_score >= 50 AND risk_score < 60 THEN 1 ELSE 0 END) AS b50_60,
+           SUM(CASE WHEN risk_score >= 60 AND risk_score < 70 THEN 1 ELSE 0 END) AS b60_70,
+           SUM(CASE WHEN risk_score >= 70 AND risk_score < 80 THEN 1 ELSE 0 END) AS b70_80,
+           SUM(CASE WHEN risk_score >= 80 AND risk_score <= 100 THEN 1 ELSE 0 END) AS b80_100
+         FROM scores
+         WHERE analyzed_at >= ? AND analyzed_at < ?`
+      )
+      .get(startIso, endIso);
+
+    const sources = this.db
+      .prepare(
+        `SELECT source_type, COUNT(*) AS cnt
+         FROM events
+         WHERE ingest_time >= ? AND ingest_time < ?
+         GROUP BY source_type
+         ORDER BY cnt DESC`
+      )
+      .all(startIso, endIso);
+
+    const blockedReasons = this.db
+      .prepare(
+        `SELECT push_reason, COUNT(*) AS cnt
+         FROM push_logs
+         WHERE push_flag = 0 AND pushed_at >= ? AND pushed_at < ?
+         GROUP BY push_reason
+         ORDER BY cnt DESC
+         LIMIT 3`
+      )
+      .all(startIso, endIso);
+
+    const topEvent = this.db
+      .prepare(
+        `SELECT e.title, e.source, s.risk_score
+         FROM scores s
+         JOIN events e ON e.event_id = s.event_id
+         WHERE s.analyzed_at >= ? AND s.analyzed_at < ?
+         ORDER BY s.risk_score DESC, s.analyzed_at DESC
+         LIMIT 1`
+      )
+      .get(startIso, endIso);
+
+    return {
+      stats: {
+        total_events: Number(stats?.total_events || 0),
+        scored_events: Number(stats?.scored_events || 0),
+        pushed_ok: Number(stats?.pushed_ok || 0)
+      },
+      score_bins: {
+        "0-20": Number(bins?.b0_20 || 0),
+        "20-40": Number(bins?.b20_40 || 0),
+        "40-50": Number(bins?.b40_50 || 0),
+        "50-60": Number(bins?.b50_60 || 0),
+        "60-70": Number(bins?.b60_70 || 0),
+        "70-80": Number(bins?.b70_80 || 0),
+        "80-100": Number(bins?.b80_100 || 0)
+      },
+      sources: sources.map((row) => ({
+        source_type: row.source_type,
+        count: Number(row.cnt || 0)
+      })),
+      blocked_reasons: blockedReasons.map((row) => ({
+        push_reason: row.push_reason,
+        count: Number(row.cnt || 0)
+      })),
+      top_event: topEvent
+        ? {
+            title: topEvent.title,
+            source: topEvent.source,
+            risk_score: Number(topEvent.risk_score || 0)
+          }
+        : null
+    };
   }
 }

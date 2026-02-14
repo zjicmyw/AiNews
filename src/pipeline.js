@@ -6,9 +6,52 @@ import { TelegramNotifier } from "./notifier/telegram.js";
 import { logger } from "./logger.js";
 import { readLines } from "./utils.js";
 
+const BJ_TIMEZONE = "Asia/Shanghai";
+
 function containsKeyword(text, keywords) {
   const lower = String(text || "").toLowerCase();
   return keywords.some((kw) => lower.includes(kw));
+}
+
+function getTimeParts(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+  const pick = (type) => parts.find((p) => p.type === type)?.value || "";
+  return {
+    year: Number.parseInt(pick("year"), 10),
+    month: Number.parseInt(pick("month"), 10),
+    day: Number.parseInt(pick("day"), 10),
+    hour: Number.parseInt(pick("hour"), 10),
+    minute: Number.parseInt(pick("minute"), 10)
+  };
+}
+
+function beijingDateKey(date = new Date()) {
+  const { year, month, day } = getTimeParts(date, BJ_TIMEZONE);
+  const mm = String(month).padStart(2, "0");
+  const dd = String(day).padStart(2, "0");
+  return `${year}-${mm}-${dd}`;
+}
+
+function beijingDayStartUtcIso(dateKey) {
+  const [year, month, day] = String(dateKey).split("-").map((v) => Number.parseInt(v, 10));
+  const ms = Date.UTC(year, month - 1, day, 0, 0, 0) - 8 * 60 * 60 * 1000;
+  return new Date(ms).toISOString();
+}
+
+function parseSchedule(value) {
+  const matched = String(value || "").match(/^(\d{1,2}):(\d{2})$/);
+  if (!matched) return { hour: 16, minute: 32, text: "16:32" };
+  const hour = Math.min(23, Math.max(0, Number.parseInt(matched[1], 10)));
+  const minute = Math.min(59, Math.max(0, Number.parseInt(matched[2], 10)));
+  return { hour, minute, text: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}` };
 }
 
 function publishToPushLatencySec(publishTimeIso) {
@@ -36,6 +79,8 @@ export class EnginePipeline {
     };
     this.isRunning = false;
     this.keywords = readLines(config.keywordsFile).map((k) => k.toLowerCase());
+    this.dailySchedule = parseSchedule(config.dailyReportTimeBj);
+    this.dailyReportInFlight = false;
   }
 
   getRuntimeStatus() {
@@ -46,6 +91,88 @@ export class EnginePipeline {
     if (event.source_type === "x") return true;
     if (this.keywords.length === 0) return true;
     return containsKeyword(`${event.title}\n${event.raw_text}`, this.keywords);
+  }
+
+  buildDailyReportMessage(reportDate, summary) {
+    const bins = summary.score_bins || {};
+    const sources = (summary.sources || [])
+      .slice(0, 3)
+      .map((item) => `${item.source_type}:${item.count}`)
+      .join(" | ");
+    const blocked = (summary.blocked_reasons || [])
+      .slice(0, 3)
+      .map((item) => `${item.push_reason}:${item.count}`)
+      .join(" | ");
+    const topEvent = summary.top_event
+      ? `${summary.top_event.risk_score.toFixed(2)} 分 | ${summary.top_event.title}`
+      : "无";
+
+    return [
+      `【每日日报】${reportDate}（北京时间）`,
+      `统计区间：00:00 - 当前`,
+      `总消息: ${summary.stats.total_events} | 已评分: ${summary.stats.scored_events} | 已推送: ${summary.stats.pushed_ok}`,
+      "",
+      "评分区间分布：",
+      `0-20: ${bins["0-20"] || 0}`,
+      `20-40: ${bins["20-40"] || 0}`,
+      `40-50: ${bins["40-50"] || 0}`,
+      `50-60: ${bins["50-60"] || 0}`,
+      `60-70: ${bins["60-70"] || 0}`,
+      `70-80: ${bins["70-80"] || 0}`,
+      `80-100: ${bins["80-100"] || 0}`,
+      "",
+      "今日精简总结：",
+      `来源分布TOP: ${sources || "无"}`,
+      `阻塞原因TOP: ${blocked || "无"}`,
+      `今日最高分: ${topEvent}`
+    ].join("\n");
+  }
+
+  async maybeSendDailyReport(trigger = "timer") {
+    if (!this.config.dailyReportEnabled || this.dailyReportInFlight) return;
+    this.dailyReportInFlight = true;
+
+    try {
+      const now = new Date();
+      const bj = getTimeParts(now, BJ_TIMEZONE);
+      const shouldSendNow =
+        bj.hour > this.dailySchedule.hour ||
+        (bj.hour === this.dailySchedule.hour && bj.minute >= this.dailySchedule.minute);
+
+      if (!shouldSendNow) return;
+
+      const dateKey = beijingDateKey(now);
+      if (this.db.hasDailyReportSent(dateKey)) return;
+
+      const startIso = beijingDayStartUtcIso(dateKey);
+      const endIso = now.toISOString();
+      const summary = this.db.getDailyReportSummary(startIso, endIso);
+      const message = this.buildDailyReportMessage(dateKey, summary);
+      const sendResult = await this.notifier.send({ message });
+
+      if (!sendResult.ok) {
+        logger.warn("daily_report_send_failed", { trigger, dateKey, reason: sendResult.reason });
+        return;
+      }
+
+      this.db.saveDailyReport({
+        reportDate: dateKey,
+        timezone: BJ_TIMEZONE,
+        scheduledTime: this.dailySchedule.text,
+        payload: summary
+      });
+      logger.info("daily_report_sent", {
+        trigger,
+        date: dateKey,
+        total_events: summary.stats.total_events,
+        scored_events: summary.stats.scored_events,
+        pushed_ok: summary.stats.pushed_ok
+      });
+    } catch (error) {
+      logger.warn("daily_report_failed", { trigger, error: String(error.message || error) });
+    } finally {
+      this.dailyReportInFlight = false;
+    }
   }
 
   async processEvent(event, marketSnapshot) {
@@ -211,13 +338,20 @@ export class EnginePipeline {
     this.isRunning = true;
 
     await this.runCycle();
+    await this.maybeSendDailyReport("startup");
+
     this.timer = setInterval(() => {
       this.runCycle();
     }, this.config.pollIntervalSec * 1000);
+
+    this.dailyReportTimer = setInterval(() => {
+      this.maybeSendDailyReport("timer");
+    }, Math.max(10, this.config.dailyReportCheckIntervalSec) * 1000);
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
+    if (this.dailyReportTimer) clearInterval(this.dailyReportTimer);
     this.isRunning = false;
   }
 }

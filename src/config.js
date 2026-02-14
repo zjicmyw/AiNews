@@ -71,8 +71,8 @@ export const config = {
 
   xBearerToken: process.env.X_BEARER_TOKEN || "",
   xApiBaseUrl: process.env.X_API_BASE_URL || "https://api.x.com/2",
-  xMinRequestIntervalSec: toInt(process.env.X_MIN_REQUEST_INTERVAL_SEC, 300),
-  xUsersPerCycle: toInt(process.env.X_USERS_PER_CYCLE, 3),
+  xMinRequestIntervalSec: toInt(process.env.X_MIN_REQUEST_INTERVAL_SEC, 60),
+  xUsersPerCycle: toInt(process.env.X_USERS_PER_CYCLE, 0),
   xMaxResultsPerUser: toInt(process.env.X_MAX_RESULTS_PER_USER, 5),
   xExcludeRetweetsReplies: toBool(process.env.X_EXCLUDE_RETWEETS_REPLIES, true),
 
@@ -81,6 +81,8 @@ export const config = {
   aiModel: process.env.AI_MODEL || process.env.GROK_MODEL || process.env.GEMINI_MODEL || "",
   aiBaseUrl: process.env.AI_BASE_URL || "",
   aiTimeoutMs: toInt(process.env.AI_TIMEOUT_MS, 15000),
+  aiMaxRequestsPerMin: toInt(process.env.AI_MAX_REQUESTS_PER_MIN, 20),
+  aiBlockedCooldownSec: toInt(process.env.AI_BLOCKED_COOLDOWN_SEC, 900),
   aiDisable: toBool(process.env.AI_DISABLE, false),
 
   geminiApiKey: process.env.GEMINI_API_KEY || "",
@@ -96,6 +98,9 @@ export const config = {
   telegramApiKeyHeader: process.env.TELEGRAM_API_KEY_HEADER || "X-API-Key",
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
   telegramChatId: process.env.TELEGRAM_CHAT_ID || "",
+  dailyReportEnabled: toBool(process.env.DAILY_REPORT_ENABLED, true),
+  dailyReportTimeBj: process.env.DAILY_REPORT_TIME_BJ || "16:32",
+  dailyReportCheckIntervalSec: toInt(process.env.DAILY_REPORT_CHECK_INTERVAL_SEC, 30),
 
   keywordsFile: process.env.KEYWORDS_FILE || "./config/keywords.txt",
   xWhitelistFile: process.env.X_WHITELIST_FILE || "./config/x_whitelist.txt",

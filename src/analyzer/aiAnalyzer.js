@@ -103,6 +103,46 @@ export class AiAnalyzer {
   constructor(config) {
     this.config = config;
     this.providerConfig = pickProviderConfig(config);
+    this.requestWindowMs = 60 * 1000;
+    this.requestTimestamps = [];
+    this.providerBlockedUntilMs = 0;
+    this.lastRateLimitWarnAtMs = 0;
+    this.lastBlockedWarnAtMs = 0;
+  }
+
+  pruneRequestWindow(nowMs) {
+    const threshold = nowMs - this.requestWindowMs;
+    while (this.requestTimestamps.length > 0 && this.requestTimestamps[0] < threshold) {
+      this.requestTimestamps.shift();
+    }
+  }
+
+  isOverLocalRateLimit(nowMs) {
+    const limit = Number(this.config.aiMaxRequestsPerMin || 0);
+    if (!Number.isFinite(limit) || limit <= 0) return false;
+    this.pruneRequestWindow(nowMs);
+    return this.requestTimestamps.length >= limit;
+  }
+
+  markRequest(nowMs) {
+    this.pruneRequestWindow(nowMs);
+    this.requestTimestamps.push(nowMs);
+  }
+
+  isProviderBlocked(nowMs) {
+    return nowMs < this.providerBlockedUntilMs;
+  }
+
+  maybeWarnOncePerMinute(type, nowMs, meta = {}) {
+    const field = type === "blocked" ? "lastBlockedWarnAtMs" : "lastRateLimitWarnAtMs";
+    if (nowMs - this[field] < 60 * 1000) return;
+    this[field] = nowMs;
+    logger.warn(type === "blocked" ? "ai_provider_cooldown_active" : "ai_local_rate_limit_active", meta);
+  }
+
+  isAbusive403(errorMessage) {
+    const text = String(errorMessage || "").toLowerCase();
+    return text.includes("http 403") && text.includes("abusive traffic patterns");
   }
 
   parseAndValidate(text) {
@@ -180,6 +220,34 @@ export class AiAnalyzer {
       return { ...heuristicAnalyze(event), _meta: { mode: "heuristic", valid: true } };
     }
 
+    const nowMs = Date.now();
+    if (this.isProviderBlocked(nowMs)) {
+      const remainSec = Math.max(1, Math.ceil((this.providerBlockedUntilMs - nowMs) / 1000));
+      this.maybeWarnOncePerMinute("blocked", nowMs, {
+        provider: this.providerConfig.provider,
+        model: this.providerConfig.model,
+        remaining_sec: remainSec
+      });
+      return {
+        ...heuristicAnalyze(event),
+        _meta: { mode: `${this.providerConfig.provider}_cooldown_heuristic`, valid: true }
+      };
+    }
+
+    if (this.isOverLocalRateLimit(nowMs)) {
+      this.maybeWarnOncePerMinute("rate_limit", nowMs, {
+        provider: this.providerConfig.provider,
+        model: this.providerConfig.model,
+        max_requests_per_min: this.config.aiMaxRequestsPerMin
+      });
+      return {
+        ...heuristicAnalyze(event),
+        _meta: { mode: `${this.providerConfig.provider}_rate_limited_heuristic`, valid: true }
+      };
+    }
+
+    this.markRequest(nowMs);
+
     try {
       const parsed =
         this.providerConfig.provider === "grok"
@@ -191,10 +259,20 @@ export class AiAnalyzer {
         _meta: { mode: this.providerConfig.provider, valid: true, model: this.providerConfig.model }
       };
     } catch (error) {
+      const errorText = String(error.message || error);
+      if (this.isAbusive403(errorText)) {
+        this.providerBlockedUntilMs = Date.now() + Math.max(60, this.config.aiBlockedCooldownSec || 900) * 1000;
+        logger.warn("ai_provider_blocked_cooldown", {
+          provider: this.providerConfig.provider,
+          model: this.providerConfig.model,
+          cooldown_sec: Math.max(60, this.config.aiBlockedCooldownSec || 900)
+        });
+      }
+
       logger.warn("ai_analyze_failed", {
         provider: this.providerConfig.provider,
         model: this.providerConfig.model,
-        error: String(error.message || error)
+        error: errorText.slice(0, 400)
       });
 
       return {

@@ -50,8 +50,8 @@ export class XCollector {
 
   pickUsersForThisCycle(usernames) {
     const size = usernames.length;
-    const take = Math.max(1, this.config.xUsersPerCycle || 1);
-    if (take >= size) return usernames;
+    const take = Number(this.config.xUsersPerCycle || 0);
+    if (take <= 0 || take >= size) return usernames;
 
     const picked = [];
     for (let i = 0; i < take; i += 1) {
@@ -95,7 +95,7 @@ export class XCollector {
     const nowSec = Math.floor(Date.now() / 1000);
     if (
       this.lastRequestAt > 0 &&
-      nowSec - this.lastRequestAt < Math.max(1, this.config.xMinRequestIntervalSec || 900)
+      nowSec - this.lastRequestAt < Math.max(1, this.config.xMinRequestIntervalSec || 60)
     ) {
       return [];
     }
