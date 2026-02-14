@@ -37,7 +37,8 @@ export const config = {
   pollIntervalSec: toInt(process.env.POLL_INTERVAL_SEC, 180),
   dbPath: process.env.DB_PATH || "./data/risk_engine.db",
 
-  level2Threshold: toInt(process.env.LEVEL2_THRESHOLD, 60),
+  level2Threshold: toInt(process.env.LEVEL2_THRESHOLD, 50),
+  xLevel2ThresholdLowerForX: toInt(process.env.X_LEVEL2_THRESHOLD_LOWER_FOR_X, 10),
   level3Threshold: toInt(process.env.LEVEL3_THRESHOLD, 75),
   marketConfirmStrong: toInt(process.env.MARKET_CONFIRM_STRONG, 70),
   level3DailyLimit: toInt(process.env.LEVEL3_DAILY_LIMIT, 3),

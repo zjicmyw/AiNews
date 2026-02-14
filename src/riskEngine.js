@@ -22,12 +22,18 @@ export class RiskEngine {
     this.db = db;
   }
 
-  computeLevel(riskScore, marketConfirmation, isDataAnomaly) {
+  computeLevel(riskScore, marketConfirmation, isDataAnomaly, thresholds = {}) {
+    const level2Threshold = Number.isFinite(thresholds.level2Threshold)
+      ? thresholds.level2Threshold
+      : this.config.level2Threshold;
+    const level3Threshold = Number.isFinite(thresholds.level3Threshold)
+      ? thresholds.level3Threshold
+      : this.config.level3Threshold;
     if (!Number.isFinite(riskScore)) return 0;
-    if (riskScore >= this.config.level3Threshold && marketConfirmation >= this.config.marketConfirmStrong && !isDataAnomaly) {
+    if (riskScore >= level3Threshold && marketConfirmation >= this.config.marketConfirmStrong && !isDataAnomaly) {
       return 3;
     }
-    if (riskScore >= this.config.level2Threshold) return 2;
+    if (riskScore >= level2Threshold) return 2;
     if (riskScore >= 40) return 1;
     return 0;
   }
@@ -89,6 +95,10 @@ export class RiskEngine {
     const assetRelevance = clamp(Number(analysis.asset_relevance || 0), 0, 100);
     const marketConfirmation = clamp(Number(marketSnapshot.confirmation_score || 0), 0, 100);
 
+    const sourceType = String(event?.source_type || "").toLowerCase();
+    const level2Lower = sourceType === "x" ? Math.max(0, this.config.xLevel2ThresholdLowerForX || 0) : 0;
+    const effectiveLevel2Threshold = Math.max(0, this.config.level2Threshold - level2Lower);
+
     const riskScore = clamp(
       newsSeverity * 0.3 + assetRelevance * 0.15 + marketConfirmation * 0.4 + sourceCredibility * 0.15,
       0,
@@ -98,7 +108,10 @@ export class RiskEngine {
     const wouldBeLevel3 =
       riskScore >= this.config.level3Threshold && marketConfirmation >= this.config.marketConfirmStrong;
     const degradedFromLevel3 = wouldBeLevel3 && marketSnapshot.is_data_anomaly;
-    const level = this.computeLevel(riskScore, marketConfirmation, marketSnapshot.is_data_anomaly);
+    const level = this.computeLevel(riskScore, marketConfirmation, marketSnapshot.is_data_anomaly, {
+      level2Threshold: effectiveLevel2Threshold,
+      level3Threshold: this.config.level3Threshold
+    });
     const regimeProbability = this.computeRegimeProbability(riskScore, marketConfirmation, marketSnapshot.is_data_anomaly);
     const regime = this.probabilityToRegime(regimeProbability);
 

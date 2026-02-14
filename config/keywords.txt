@@ -1,4 +1,5 @@
-﻿sanction
+﻿# EN - geopolitics and macro
+sanction
 tariff
 ceasefire
 strike
@@ -9,3 +10,100 @@ strait
 pipeline
 central bank
 military drill
+war
+missile
+drone
+attack
+conflict
+navy
+airstrike
+terror
+hostage
+nuclear
+oil shock
+gas supply
+shipping
+blockade
+commodity
+inflation
+cpi
+ppi
+nfp
+payrolls
+fomc
+fed
+ecb
+pboc
+boj
+boc
+rate hike
+rate cut
+liquidity
+quantitative tightening
+qt
+quantitative easing
+qe
+emergency meeting
+default
+bank run
+credit event
+sovereign debt
+devaluation
+
+# EN - crypto specific
+bitcoin
+btc
+ethereum
+eth
+solana
+sol
+xrp
+stablecoin
+usdt
+usdc
+exchange hack
+exploit
+liquidation
+whale
+etf
+sec
+cftc
+on-chain
+
+# ZH - 宏观与地缘
+制裁
+关税
+停火
+罢工
+战争
+入侵
+冲突
+导弹
+无人机
+封锁
+石油
+天然气
+供应中断
+央行
+加息
+降息
+流动性
+通胀
+非农
+紧急会议
+主权债务
+汇率贬值
+
+# ZH - 加密市场
+比特币
+以太坊
+山寨
+稳定币
+交易所
+黑客
+爆仓
+清算
+鲸鱼
+链上
+现货ETF
+监管
