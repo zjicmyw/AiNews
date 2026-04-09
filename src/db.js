@@ -2,6 +2,14 @@
 import crypto from "node:crypto";
 import { ensureDirForFile, nowSec, normalizeTitle } from "./utils.js";
 
+function safeParseJson(value, fallback) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
 export class DbClient {
   constructor(dbPath) {
     ensureDirForFile(dbPath);
@@ -362,7 +370,7 @@ export class DbClient {
       .run(
         reportDate,
         timezone || "Asia/Shanghai",
-        scheduledTime || "16:32",
+        scheduledTime || "16:43",
         new Date().toISOString(),
         JSON.stringify(payload || {})
       );
@@ -454,6 +462,129 @@ export class DbClient {
             title: topEvent.title,
             source: topEvent.source,
             risk_score: Number(topEvent.risk_score || 0)
+          }
+        : null
+    };
+  }
+
+  getDailySummaryInput(startIso, endIso, maxEvents = 5) {
+    const summary = this.getDailyReportSummary(startIso, endIso);
+    const limit = Math.max(1, Math.min(10, Number(maxEvents || 5)));
+    const seen = new Set();
+    const selectedEvents = [];
+
+    const candidateRows = this.db
+      .prepare(
+        `SELECT payload, pushed_at, push_flag
+         FROM push_logs
+         WHERE pushed_at >= ? AND pushed_at < ? AND payload IS NOT NULL
+         ORDER BY push_flag DESC, pushed_at DESC
+         LIMIT 240`
+      )
+      .all(startIso, endIso);
+
+    for (const row of candidateRows) {
+      const payload = safeParseJson(row.payload, null);
+      if (!payload?.event?.title) continue;
+      const eventId = payload.event_id || payload.event?.event_id || null;
+      const dedupKey = eventId || `${payload.event.title}|${payload.event.publish_time || ""}|${payload.event.source || ""}`;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+
+      selectedEvents.push({
+        event_id: eventId,
+        title: payload.event.title,
+        title_zh: payload.analysis?.title_zh || "",
+        source: payload.event.source || "",
+        risk_score: Number(payload.scoreResult?.risk_score || 0),
+        level: Number(payload.scoreResult?.level || 0),
+        regime: payload.scoreResult?.regime || "",
+        reasons: Array.isArray(payload.analysis?.reasons) ? payload.analysis.reasons.slice(0, 2) : [],
+        asset_actions: Array.isArray(payload.analysis?.asset_actions) ? payload.analysis.asset_actions.slice(0, 3) : [],
+        publish_time: payload.event.publish_time || null
+      });
+    }
+
+    selectedEvents.sort((a, b) => b.risk_score - a.risk_score);
+    const events = selectedEvents.slice(0, limit);
+    for (const item of events) {
+      const key = item.event_id || `${item.title}|${item.publish_time || ""}|${item.source || ""}`;
+      seen.add(key);
+    }
+
+    if (events.length < limit) {
+      const backupRows = this.db
+        .prepare(
+          `SELECT e.event_id, e.title, e.source, e.publish_time, s.risk_score, s.level, s.regime, s.decision_reasons
+           FROM scores s
+           JOIN events e ON e.event_id = s.event_id
+           WHERE s.analyzed_at >= ? AND s.analyzed_at < ?
+           ORDER BY s.risk_score DESC, s.analyzed_at DESC
+           LIMIT 60`
+        )
+        .all(startIso, endIso);
+
+      for (const row of backupRows) {
+        const key = row.event_id || `${row.title}|${row.publish_time || ""}|${row.source || ""}`;
+        if (seen.has(key)) continue;
+        const reasonsRaw = safeParseJson(row.decision_reasons, []);
+        events.push({
+          event_id: row.event_id,
+          title: row.title,
+          title_zh: "",
+          source: row.source,
+          risk_score: Number(row.risk_score || 0),
+          level: Number(row.level || 0),
+          regime: row.regime || "",
+          reasons: Array.isArray(reasonsRaw) ? reasonsRaw.slice(0, 2) : [],
+          asset_actions: [],
+          publish_time: row.publish_time || null
+        });
+        seen.add(key);
+        if (events.length >= limit) break;
+      }
+    }
+
+    const marketSnapshot =
+      this.db
+        .prepare(
+          `SELECT ts, confirmation_score, is_data_anomaly, anomaly_reasons, btc_change_1h, equities_change_1h, gold_change_1h, dxy_change_1h
+           FROM market_snapshots
+           WHERE ts >= ? AND ts < ?
+           ORDER BY ts DESC
+           LIMIT 1`
+        )
+        .get(startIso, endIso) ||
+      this.db
+        .prepare(
+          `SELECT ts, confirmation_score, is_data_anomaly, anomaly_reasons, btc_change_1h, equities_change_1h, gold_change_1h, dxy_change_1h
+           FROM market_snapshots
+           ORDER BY ts DESC
+           LIMIT 1`
+        )
+        .get();
+
+    return {
+      report_window: {
+        start_iso: startIso,
+        end_iso: endIso
+      },
+      stats: summary.stats,
+      score_bins: summary.score_bins,
+      sources: summary.sources,
+      blocked_reasons: summary.blocked_reasons,
+      top_event: summary.top_event,
+      events: events.sort((a, b) => b.risk_score - a.risk_score).slice(0, limit),
+      market_snapshot: marketSnapshot
+        ? {
+            ts: marketSnapshot.ts,
+            confirmation_score: Number(marketSnapshot.confirmation_score || 0),
+            is_data_anomaly: Boolean(marketSnapshot.is_data_anomaly),
+            anomaly_reasons: safeParseJson(marketSnapshot.anomaly_reasons, []),
+            btc_change_1h: marketSnapshot.btc_change_1h,
+            equities_change_1h: marketSnapshot.equities_change_1h,
+            gold_change_1h: marketSnapshot.gold_change_1h,
+            dxy_change_1h: marketSnapshot.dxy_change_1h
           }
         : null
     };

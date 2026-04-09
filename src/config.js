@@ -1,4 +1,4 @@
-import dotenv from "dotenv";
+﻿import dotenv from "dotenv";
 
 dotenv.config();
 
@@ -83,6 +83,8 @@ export const config = {
   aiTimeoutMs: toInt(process.env.AI_TIMEOUT_MS, 15000),
   aiMaxRequestsPerMin: toInt(process.env.AI_MAX_REQUESTS_PER_MIN, 20),
   aiBlockedCooldownSec: toInt(process.env.AI_BLOCKED_COOLDOWN_SEC, 900),
+  aiLlmCandidateMinScore: toInt(process.env.AI_LLM_CANDIDATE_MIN_SCORE, 55),
+  aiEventRawTextMaxChars: toInt(process.env.AI_EVENT_RAW_TEXT_MAX_CHARS, 500),
   aiDisable: toBool(process.env.AI_DISABLE, false),
 
   geminiApiKey: process.env.GEMINI_API_KEY || "",
@@ -91,7 +93,7 @@ export const config = {
   grokModel: process.env.GROK_MODEL || "grok-3-latest",
 
   telegramEnabled: toBool(process.env.TELEGRAM_ENABLED, true),
-  telegramMode: (process.env.TELEGRAM_MODE || "relay").toLowerCase(), // relay | direct
+  telegramMode: (process.env.TELEGRAM_MODE || "relay").toLowerCase(),
   telegramServiceUrl: process.env.TELEGRAM_BOT_API_URL || process.env.TELEGRAM_SERVICE_URL || "http://127.0.0.1:3000",
   telegramServicePath: process.env.TELEGRAM_SERVICE_PATH || "/send-message",
   telegramApiKey: process.env.TELEGRAM_API_KEY || process.env.API_KEY || "",
@@ -99,8 +101,10 @@ export const config = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
   telegramChatId: process.env.TELEGRAM_CHAT_ID || "",
   dailyReportEnabled: toBool(process.env.DAILY_REPORT_ENABLED, true),
-  dailyReportTimeBj: process.env.DAILY_REPORT_TIME_BJ || "16:32",
+  dailyReportTimeBj: process.env.DAILY_REPORT_TIME_BJ || "16:43",
   dailyReportCheckIntervalSec: toInt(process.env.DAILY_REPORT_CHECK_INTERVAL_SEC, 30),
+  dailyReportMaxEvents: toInt(process.env.DAILY_REPORT_MAX_EVENTS, 5),
+  dailyReportMessageMaxChars: toInt(process.env.DAILY_REPORT_MESSAGE_MAX_CHARS, 1200),
 
   keywordsFile: process.env.KEYWORDS_FILE || "./config/keywords.txt",
   xWhitelistFile: process.env.X_WHITELIST_FILE || "./config/x_whitelist.txt",

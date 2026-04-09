@@ -1,14 +1,26 @@
-function buildAdvice(level, analysis) {
-  const assets = (analysis.assets || []).join(", ");
-  if (level >= 3) {
-    return `建议：降低 Alt 暴露，适度提高 BTC/稳定币权重。关注资产：${assets || "BTC, ALT"}`;
-  }
-  return `建议：控制新增高 Beta 仓位，保持防守，关注资产：${assets || "BTC, ALT"}`;
-}
-
-function fmtNum(value) {
+﻿function fmtNum(value) {
   if (!Number.isFinite(value)) return "N/A";
   return value.toFixed(2);
+}
+
+function mapConfidence(confidence) {
+  if (confidence === "high") return "高置信";
+  if (confidence === "low") return "低置信";
+  return "中置信";
+}
+
+function formatAssetActions(assetActions) {
+  const items = Array.isArray(assetActions) ? assetActions.slice(0, 3) : [];
+  if (items.length === 0) {
+    return ["· BTC — 观望（低置信）：信息有限，建议保持谨慎。"];
+  }
+  return items.map((item) => {
+    const asset = String(item?.asset || "BTC");
+    const action = String(item?.action || "观望");
+    const confidence = mapConfidence(item?.confidence);
+    const rationale = String(item?.rationale || "信息有限，建议保持谨慎。");
+    return `· ${asset} — ${action}（${confidence}）：${rationale}`;
+  });
 }
 
 export class TelegramNotifier {
@@ -18,17 +30,23 @@ export class TelegramNotifier {
 
   buildMessage({ level, event, analysis, scoreResult, marketSnapshot, degraded }) {
     const lines = [];
+    const title = String(analysis?.title_zh || "").trim() || event.title;
+
     lines.push(`【风险预警】Level ${level}`);
     lines.push(`RiskScore: ${fmtNum(scoreResult.risk_score)} | MarketConfirm: ${fmtNum(scoreResult.market_confirmation)}`);
     lines.push(`Regime: ${scoreResult.regime} (${scoreResult.regime_probability})`);
-    lines.push(`事件: ${event.title}`);
+    lines.push("");
+    lines.push(`事件: ${title}`);
     lines.push(`来源: ${event.source}`);
     lines.push(`链接: ${event.url || "N/A"}`);
+    lines.push("");
     lines.push("风险解读:");
-    for (const reason of (analysis.reasons || []).slice(0, 3)) {
+    for (const reason of (analysis?.reasons || []).slice(0, 2)) {
       lines.push(`- ${reason}`);
     }
-    lines.push(buildAdvice(level, analysis));
+    lines.push("");
+    lines.push("操作建议:");
+    lines.push(...formatAssetActions(analysis?.asset_actions));
 
     if (degraded) {
       lines.push("注意：市场确认不足，按 Level 2 降级推送。");

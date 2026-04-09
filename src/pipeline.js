@@ -48,7 +48,7 @@ function beijingDayStartUtcIso(dateKey) {
 
 function parseSchedule(value) {
   const matched = String(value || "").match(/^(\d{1,2}):(\d{2})$/);
-  if (!matched) return { hour: 16, minute: 32, text: "16:32" };
+  if (!matched) return { hour: 16, minute: 43, text: "16:43" };
   const hour = Math.min(23, Math.max(0, Number.parseInt(matched[1], 10)));
   const minute = Math.min(59, Math.max(0, Number.parseInt(matched[2], 10)));
   return { hour, minute, text: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}` };
@@ -93,7 +93,7 @@ export class EnginePipeline {
     return containsKeyword(`${event.title}\n${event.raw_text}`, this.keywords);
   }
 
-  buildDailyReportMessage(reportDate, summary) {
+  buildDailyReportFallbackMessage(reportDate, summary) {
     const bins = summary.score_bins || {};
     const sources = (summary.sources || [])
       .slice(0, 3)
@@ -109,7 +109,7 @@ export class EnginePipeline {
 
     return [
       `【每日日报】${reportDate}（北京时间）`,
-      `统计区间：00:00 - 当前`,
+      "统计区间：00:00 - 当前",
       `总消息: ${summary.stats.total_events} | 已评分: ${summary.stats.scored_events} | 已推送: ${summary.stats.pushed_ok}`,
       "",
       "评分区间分布：",
@@ -126,6 +126,57 @@ export class EnginePipeline {
       `阻塞原因TOP: ${blocked || "无"}`,
       `今日最高分: ${topEvent}`
     ].join("\n");
+  }
+
+  buildLightDailyReportMessage(reportDate, dailyInput, aiSummary) {
+    const stats = dailyInput.stats || {};
+    const topEvent = dailyInput.top_event ? `${dailyInput.top_event.risk_score.toFixed(2)} 分 | ${dailyInput.top_event.title}` : "无";
+    const keyRisks = (aiSummary.key_risks || []).slice(0, 3);
+    let assetOutlook = (aiSummary.asset_outlook || []).slice(0, 3);
+    let riskWatch = (aiSummary.risk_watch || []).slice(0, 2);
+
+    const build = () => {
+      const lines = [];
+      lines.push(`【每日轻量总结】${reportDate}（北京时间）`);
+      lines.push("统计区间：当日 00:00 - 当前");
+      lines.push(`总消息: ${stats.total_events || 0} | 已评分: ${stats.scored_events || 0} | 已推送: ${stats.pushed_ok || 0}`);
+      lines.push("");
+      lines.push(`概览: ${aiSummary.summary_title}`);
+      lines.push(`Regime: ${aiSummary.regime_summary}`);
+      lines.push("");
+      lines.push("核心风险：");
+      for (const item of keyRisks) {
+        lines.push(`- ${item}`);
+      }
+      lines.push("");
+      lines.push("资产建议：");
+      for (const item of assetOutlook) {
+        lines.push(`· ${item.asset} — ${item.action}：${item.rationale}`);
+      }
+      lines.push("");
+      lines.push("后续关注：");
+      for (const item of riskWatch) {
+        lines.push(`- ${item}`);
+      }
+      lines.push("");
+      lines.push(`综合判断: ${aiSummary.overall_assessment}`);
+      lines.push(`今日最高分: ${topEvent}`);
+      return lines.join("\n");
+    };
+
+    let message = build();
+    while (message.length > this.config.dailyReportMessageMaxChars && assetOutlook.length > 1) {
+      assetOutlook = assetOutlook.slice(0, -1);
+      message = build();
+    }
+    while (message.length > this.config.dailyReportMessageMaxChars && riskWatch.length > 1) {
+      riskWatch = riskWatch.slice(0, -1);
+      message = build();
+    }
+    if (message.length > this.config.dailyReportMessageMaxChars) {
+      message = `${message.slice(0, this.config.dailyReportMessageMaxChars - 1)}…`;
+    }
+    return message;
   }
 
   async maybeSendDailyReport(trigger = "timer") {
@@ -146,8 +197,33 @@ export class EnginePipeline {
 
       const startIso = beijingDayStartUtcIso(dateKey);
       const endIso = now.toISOString();
-      const summary = this.db.getDailyReportSummary(startIso, endIso);
-      const message = this.buildDailyReportMessage(dateKey, summary);
+      const dailyInput = this.db.getDailySummaryInput(startIso, endIso, this.config.dailyReportMaxEvents);
+      let message;
+      let payload;
+
+      try {
+        const aiSummary = await this.analyzer.generateDailySummary({ ...dailyInput, report_date: dateKey });
+        message = this.buildLightDailyReportMessage(dateKey, dailyInput, aiSummary);
+        payload = {
+          mode: "ai_light_summary",
+          summary: aiSummary,
+          stats: dailyInput.stats,
+          event_count: (dailyInput.events || []).length
+        };
+      } catch (error) {
+        logger.warn("daily_report_ai_failed", {
+          trigger,
+          date: dateKey,
+          error: String(error.message || error)
+        });
+        message = this.buildDailyReportFallbackMessage(dateKey, dailyInput);
+        payload = {
+          mode: "fallback_stats",
+          stats: dailyInput.stats,
+          reason: String(error.message || error)
+        };
+      }
+
       const sendResult = await this.notifier.send({ message });
 
       if (!sendResult.ok) {
@@ -159,14 +235,15 @@ export class EnginePipeline {
         reportDate: dateKey,
         timezone: BJ_TIMEZONE,
         scheduledTime: this.dailySchedule.text,
-        payload: summary
+        payload
       });
       logger.info("daily_report_sent", {
         trigger,
         date: dateKey,
-        total_events: summary.stats.total_events,
-        scored_events: summary.stats.scored_events,
-        pushed_ok: summary.stats.pushed_ok
+        total_events: dailyInput.stats.total_events,
+        scored_events: dailyInput.stats.scored_events,
+        pushed_ok: dailyInput.stats.pushed_ok,
+        mode: payload.mode
       });
     } catch (error) {
       logger.warn("daily_report_failed", { trigger, error: String(error.message || error) });
