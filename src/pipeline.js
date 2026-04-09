@@ -79,6 +79,7 @@ export class EnginePipeline {
     };
     this.isRunning = false;
     this.keywords = readLines(config.keywordsFile).map((k) => k.toLowerCase());
+    this.suppressKeywords = readLines(config.suppressKeywordsFile).map((k) => k.toLowerCase());
     this.dailySchedule = parseSchedule(config.dailyReportTimeBj);
     this.dailyReportInFlight = false;
   }
@@ -91,6 +92,11 @@ export class EnginePipeline {
     if (event.source_type === "x") return true;
     if (this.keywords.length === 0) return true;
     return containsKeyword(`${event.title}\n${event.raw_text}`, this.keywords);
+  }
+
+  shouldSuppress(event) {
+    if (this.suppressKeywords.length === 0) return false;
+    return containsKeyword(`${event.title}\n${event.raw_text}`, this.suppressKeywords);
   }
 
   buildDailyReportFallbackMessage(reportDate, summary) {
@@ -255,6 +261,21 @@ export class EnginePipeline {
   async processEvent(event, marketSnapshot) {
     const inserted = this.db.insertEventIfNew(event);
     if (!inserted.inserted) return;
+
+    if (this.shouldSuppress(event)) {
+      this.db.insertPushLog({
+        event_id: inserted.eventId,
+        dedup_key: inserted.dedupKey,
+        level: 0,
+        push_flag: false,
+        push_reason: "suppress_keyword_skip",
+        payload: {
+          event,
+          suppress_keywords: this.suppressKeywords
+        }
+      });
+      return;
+    }
 
     if (!this.shouldAnalyze(event)) {
       this.db.insertPushLog({

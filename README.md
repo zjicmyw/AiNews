@@ -71,6 +71,7 @@ npm start
 - `DAILY_REPORT_CHECK_INTERVAL_SEC=30`
 - `DAILY_REPORT_MAX_EVENTS=5`
 - `DAILY_REPORT_MESSAGE_MAX_CHARS=1200`
+- `SUPPRESS_KEYWORDS_FILE=./config/suppress_keywords.txt`
 
 ## 接口
 - `GET /status.json`

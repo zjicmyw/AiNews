@@ -107,6 +107,7 @@ export const config = {
   dailyReportMessageMaxChars: toInt(process.env.DAILY_REPORT_MESSAGE_MAX_CHARS, 1200),
 
   keywordsFile: process.env.KEYWORDS_FILE || "./config/keywords.txt",
+  suppressKeywordsFile: process.env.SUPPRESS_KEYWORDS_FILE || "./config/suppress_keywords.txt",
   xWhitelistFile: process.env.X_WHITELIST_FILE || "./config/x_whitelist.txt",
   rssFeeds: splitCsv(
     process.env.RSS_FEEDS ||

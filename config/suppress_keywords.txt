@@ -1,0 +1,9 @@
+# Temporary hard blocklist: matching events will not enter AI analysis or push flow
+oil
+middle east
+israel
+iran
+石油
+中东
+以色列
+伊朗
