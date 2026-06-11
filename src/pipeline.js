@@ -3,6 +3,7 @@ import { AiAnalyzer } from "./analyzer/aiAnalyzer.js";
 import { MarketModule } from "./market/index.js";
 import { RiskEngine } from "./riskEngine.js";
 import { TelegramNotifier } from "./notifier/telegram.js";
+import { OpportunityMonitor } from "./opportunityMonitor.js";
 import { logger } from "./logger.js";
 import { readLines } from "./utils.js";
 
@@ -69,6 +70,7 @@ export class EnginePipeline {
     this.marketModule = new MarketModule(config, tradingViewSignalStore);
     this.riskEngine = new RiskEngine(config, db);
     this.notifier = new TelegramNotifier(config);
+    this.opportunityMonitor = new OpportunityMonitor({ config, db });
     this.runtimeStatus = {
       regime: "Neutral",
       regime_probability: 50,
@@ -86,6 +88,14 @@ export class EnginePipeline {
 
   getRuntimeStatus() {
     return this.runtimeStatus;
+  }
+
+  getOpportunityStatus() {
+    return this.opportunityMonitor.getStatus();
+  }
+
+  getOpportunityQueryPlan() {
+    return this.opportunityMonitor.getQueryPlan();
   }
 
   shouldAnalyze(event) {
@@ -445,11 +455,14 @@ export class EnginePipeline {
     this.dailyReportTimer = setInterval(() => {
       this.maybeSendDailyReport("timer");
     }, Math.max(10, this.config.dailyReportCheckIntervalSec) * 1000);
+
+    this.opportunityMonitor.start();
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
     if (this.dailyReportTimer) clearInterval(this.dailyReportTimer);
+    this.opportunityMonitor.stop();
     this.isRunning = false;
   }
 }

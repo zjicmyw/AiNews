@@ -14,7 +14,9 @@ async function main() {
     config,
     db,
     tradingViewSignalStore,
-    getRuntimeStatus: () => pipeline.getRuntimeStatus()
+    getRuntimeStatus: () => pipeline.getRuntimeStatus(),
+    getOpportunityStatus: () => pipeline.getOpportunityStatus(),
+    getOpportunityQueryPlan: () => pipeline.getOpportunityQueryPlan()
   });
 
   await pipeline.start();

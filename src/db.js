@@ -10,6 +10,12 @@ function safeParseJson(value, fallback) {
   }
 }
 
+function ensureColumn(db, table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (columns.some((row) => row.name === column)) return;
+  db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+}
+
 export class DbClient {
   constructor(dbPath) {
     ensureDirForFile(dbPath);
@@ -106,12 +112,121 @@ export class DbClient {
         payload TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS opportunity_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        status TEXT NOT NULL,
+        duration_ms INTEGER,
+        prompt TEXT,
+        raw_response TEXT,
+        error TEXT,
+        item_count INTEGER DEFAULT 0
+      );
+
+      CREATE TABLE IF NOT EXISTS opportunities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dedup_key TEXT NOT NULL UNIQUE,
+        activity_name TEXT NOT NULL,
+        type TEXT NOT NULL,
+        section TEXT NOT NULL,
+        exchange TEXT,
+        venue TEXT,
+        asset TEXT,
+        stablecoin TEXT,
+        apy REAL,
+        expected_yield TEXT,
+        reward TEXT,
+        duration TEXT,
+        deadline_at TEXT,
+        source_published_at TEXT,
+        participation TEXT,
+        source_user TEXT,
+        source_url TEXT,
+        credibility TEXT,
+        risk_note TEXT,
+        status TEXT NOT NULL,
+        raw_json TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_events_ingest_time ON events(ingest_time);
       CREATE INDEX IF NOT EXISTS idx_push_logs_pushed_at ON push_logs(pushed_at);
       CREATE INDEX IF NOT EXISTS idx_push_logs_dedup_key ON push_logs(dedup_key);
       CREATE INDEX IF NOT EXISTS idx_x_user_cache_updated_at ON x_user_cache(updated_at);
       CREATE INDEX IF NOT EXISTS idx_x_since_cache_updated_at ON x_since_cache(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_opportunity_runs_started_at ON opportunity_runs(started_at);
+      CREATE INDEX IF NOT EXISTS idx_opportunities_status_last_seen ON opportunities(status, last_seen_at);
+      CREATE INDEX IF NOT EXISTS idx_opportunities_section_type ON opportunities(section, type);
     `);
+
+    ensureColumn(this.db, "opportunities", "official_url", "TEXT");
+    ensureColumn(this.db, "opportunities", "official_url_source", "TEXT");
+    ensureColumn(this.db, "opportunities", "deadline_source", "TEXT");
+    ensureColumn(this.db, "opportunities", "deadline_confidence", "REAL");
+    ensureColumn(this.db, "opportunities", "deadline_text", "TEXT");
+    ensureColumn(this.db, "opportunities", "enriched_at", "TEXT");
+    ensureColumn(this.db, "opportunities", "enrichment_error", "TEXT");
+    ensureColumn(this.db, "opportunity_runs", "job_stats", "TEXT");
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_opportunities_deadline_source ON opportunities(deadline_source);
+    `);
+    this.db
+      .prepare(
+        `UPDATE opportunities
+         SET official_url_source = 'official_page'
+         WHERE official_url IS NOT NULL AND official_url_source IS NULL`
+      )
+      .run();
+    this.db
+      .prepare(
+        `UPDATE opportunities
+         SET deadline_source = 'xintel',
+             deadline_confidence = COALESCE(deadline_confidence, 0.55),
+             deadline_text = COALESCE(deadline_text, duration)
+         WHERE deadline_at IS NOT NULL AND deadline_source IS NULL`
+      )
+      .run();
+    this.db
+      .prepare(
+        `UPDATE opportunities
+         SET deadline_confidence = deadline_confidence / 100.0
+         WHERE deadline_confidence > 1`
+      )
+      .run();
+    this.db
+      .prepare(
+        `UPDATE opportunities
+         SET deadline_source = NULL,
+             deadline_confidence = NULL
+         WHERE deadline_at IS NULL
+           AND (deadline_source IS NULL OR deadline_source != 'no_fixed_deadline')`
+      )
+      .run();
+    this.db
+      .prepare(
+        `UPDATE opportunities
+         SET deadline_source = 'no_fixed_deadline',
+             deadline_confidence = COALESCE(deadline_confidence, 0.55),
+             deadline_text = COALESCE(deadline_text, '无固定截止')
+         WHERE deadline_at IS NULL
+           AND (
+             lower(COALESCE(deadline_text, '')) LIKE '%ongoing%'
+             OR lower(COALESCE(deadline_text, '')) LIKE '%no fixed%'
+             OR lower(COALESCE(deadline_text, '')) LIKE '%monthly%'
+             OR COALESCE(deadline_text, '') LIKE '%持续中%'
+             OR COALESCE(deadline_text, '') LIKE '%无固定截止%'
+             OR COALESCE(deadline_text, '') LIKE '%未注明固定截止%'
+             OR COALESCE(duration, '') LIKE '%持续%'
+             OR lower(COALESCE(duration, '')) LIKE '%monthly%'
+             OR lower(COALESCE(risk_note, '')) LIKE '%no fixed end date%'
+             OR COALESCE(risk_note, '') LIKE '%未注明固定截止%'
+           )`
+      )
+      .run();
   }
 
   close() {
@@ -313,11 +428,241 @@ export class DbClient {
   getStats() {
     const events = this.db.prepare(`SELECT COUNT(*) AS cnt FROM events`).get();
     const pushes = this.db.prepare(`SELECT COUNT(*) AS cnt FROM push_logs WHERE push_flag = 1`).get();
+    const activeOpportunities = this.db
+      .prepare(`SELECT COUNT(*) AS cnt FROM opportunities WHERE status = 'active'`)
+      .get();
     return {
       total_events: Number(events?.cnt || 0),
       total_pushes: Number(pushes?.cnt || 0),
+      active_opportunities: Number(activeOpportunities?.cnt || 0),
       now_sec: nowSec()
     };
+  }
+
+  startOpportunityRun({ startedAt, prompt }) {
+    const result = this.db
+      .prepare(
+        `INSERT INTO opportunity_runs (started_at, status, prompt, item_count)
+         VALUES (?, 'running', ?, 0)`
+      )
+      .run(startedAt || new Date().toISOString(), prompt || "");
+    return result.lastInsertRowid;
+  }
+
+  finishOpportunityRun(runId, { status, durationMs, rawResponse, error, itemCount, jobStats }) {
+    if (!runId) return;
+    this.db
+      .prepare(
+        `UPDATE opportunity_runs
+         SET finished_at = ?, status = ?, duration_ms = ?, raw_response = ?, error = ?, item_count = ?, job_stats = ?
+         WHERE id = ?`
+      )
+      .run(
+        new Date().toISOString(),
+        status || "ok",
+        Number.isFinite(durationMs) ? durationMs : null,
+        rawResponse || "",
+        error || "",
+        Number.isFinite(itemCount) ? itemCount : 0,
+        Array.isArray(jobStats) ? JSON.stringify(jobStats) : null,
+        runId
+      );
+  }
+
+  upsertOpportunity(item) {
+    const nowIso = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO opportunities (
+          dedup_key, activity_name, type, section, exchange, venue, asset, stablecoin, apy,
+          expected_yield, reward, duration, deadline_at, source_published_at, participation,
+          source_user, source_url, credibility, risk_note, status, official_url,
+          official_url_source, deadline_source, deadline_confidence, deadline_text, enriched_at, enrichment_error, raw_json,
+          first_seen_at, last_seen_at, updated_at
+        ) VALUES (
+          @dedup_key, @activity_name, @type, @section, @exchange, @venue, @asset, @stablecoin, @apy,
+          @expected_yield, @reward, @duration, @deadline_at, @source_published_at, @participation,
+          @source_user, @source_url, @credibility, @risk_note, @status, @official_url,
+          @official_url_source, @deadline_source, @deadline_confidence, @deadline_text, @enriched_at, @enrichment_error, @raw_json,
+          @first_seen_at, @last_seen_at, @updated_at
+        )
+        ON CONFLICT(dedup_key) DO UPDATE SET
+          activity_name=excluded.activity_name,
+          type=excluded.type,
+          section=excluded.section,
+          exchange=excluded.exchange,
+          venue=excluded.venue,
+          asset=excluded.asset,
+          stablecoin=excluded.stablecoin,
+          apy=excluded.apy,
+          expected_yield=excluded.expected_yield,
+          reward=excluded.reward,
+          duration=excluded.duration,
+          deadline_at=COALESCE(excluded.deadline_at, opportunities.deadline_at),
+          source_published_at=excluded.source_published_at,
+          participation=excluded.participation,
+          source_user=excluded.source_user,
+          source_url=excluded.source_url,
+          credibility=excluded.credibility,
+          risk_note=excluded.risk_note,
+          status=CASE
+            WHEN excluded.status = 'unverified' AND opportunities.status = 'active' AND opportunities.deadline_at IS NOT NULL THEN opportunities.status
+            ELSE excluded.status
+          END,
+          official_url=COALESCE(excluded.official_url, opportunities.official_url),
+          official_url_source=COALESCE(excluded.official_url_source, opportunities.official_url_source),
+          deadline_source=COALESCE(excluded.deadline_source, opportunities.deadline_source),
+          deadline_confidence=COALESCE(excluded.deadline_confidence, opportunities.deadline_confidence),
+          deadline_text=COALESCE(excluded.deadline_text, opportunities.deadline_text),
+          enriched_at=COALESCE(excluded.enriched_at, opportunities.enriched_at),
+          enrichment_error=excluded.enrichment_error,
+          raw_json=excluded.raw_json,
+          last_seen_at=excluded.last_seen_at,
+          updated_at=excluded.updated_at`
+      )
+      .run({
+        dedup_key: item.dedup_key,
+        activity_name: item.activity_name,
+        type: item.type,
+        section: item.section,
+        exchange: item.exchange || null,
+        venue: item.venue || null,
+        asset: item.asset || null,
+        stablecoin: item.stablecoin || null,
+        apy: Number.isFinite(item.apy) ? item.apy : null,
+        expected_yield: item.expected_yield || null,
+        reward: item.reward || null,
+        duration: item.duration || null,
+        deadline_at: item.deadline_at || null,
+        source_published_at: item.source_published_at || null,
+        participation: item.participation || null,
+        source_user: item.source_user || null,
+        source_url: item.source_url || null,
+        credibility: item.credibility || "unverified",
+        risk_note: item.risk_note || null,
+        status: item.status || "unverified",
+        official_url: item.official_url || null,
+        official_url_source: item.official_url_source || null,
+        deadline_source: item.deadline_source || null,
+        deadline_confidence: Number.isFinite(item.deadline_confidence) ? item.deadline_confidence : null,
+        deadline_text: item.deadline_text || null,
+        enriched_at: item.enriched_at || null,
+        enrichment_error: item.enrichment_error || null,
+        raw_json: item.raw_json || JSON.stringify(item),
+        first_seen_at: item.first_seen_at || nowIso,
+        last_seen_at: nowIso,
+        updated_at: nowIso
+      });
+  }
+
+  getOpportunityDeadlineEnrichmentCandidates(
+    limit = 5,
+    retryCooldownHours = 12,
+    nowIso = new Date().toISOString()
+  ) {
+    const cooldownHours = Math.max(0, Number(retryCooldownHours || 0));
+    const retryBefore = new Date(Date.parse(nowIso) - cooldownHours * 60 * 60 * 1000).toISOString();
+    return this.db
+      .prepare(
+        `SELECT *
+         FROM opportunities
+         WHERE status IN ('active', 'unverified')
+           AND (deadline_at IS NULL OR deadline_source IS NULL OR official_url IS NULL)
+           AND COALESCE(deadline_source, '') != 'no_fixed_deadline'
+           AND (enriched_at IS NULL OR enriched_at < ?)
+         ORDER BY
+           CASE WHEN deadline_at IS NULL THEN 0 ELSE 1 END,
+           CASE section WHEN 'cex' THEN 0 ELSE 1 END,
+           CASE type
+             WHEN 'stablecoin_earn' THEN 0
+             WHEN 'pre_ipo' THEN 1
+             WHEN 'launch' THEN 2
+             WHEN 'onchain' THEN 3
+             ELSE 4
+           END,
+           COALESCE(apy, 0) DESC,
+           last_seen_at DESC
+         LIMIT ?`
+      )
+      .all(retryBefore, Math.max(1, Number(limit || 5)))
+      .map((row) => ({
+        ...row,
+        apy: row.apy === null || row.apy === undefined ? null : Number(row.apy),
+        deadline_confidence:
+          row.deadline_confidence === null || row.deadline_confidence === undefined
+            ? null
+            : Number(row.deadline_confidence)
+      }));
+  }
+
+  markExpiredOpportunities(nowIso = new Date().toISOString()) {
+    this.db
+      .prepare(
+        `UPDATE opportunities
+         SET status = 'expired', updated_at = ?
+         WHERE status != 'expired' AND deadline_at IS NOT NULL AND deadline_at < ?`
+      )
+      .run(nowIso, nowIso);
+  }
+
+  getActiveOpportunities(staleAfterHours = 96, nowIso = new Date().toISOString()) {
+    return this.getDisplayOpportunities(staleAfterHours, nowIso).filter((row) => row.status === "active");
+  }
+
+  getDisplayOpportunities(staleAfterHours = 96, nowIso = new Date().toISOString()) {
+    const staleHours = Math.max(1, Number(staleAfterHours || 96));
+    const staleThreshold = new Date(Date.parse(nowIso) - staleHours * 60 * 60 * 1000).toISOString();
+    return this.db
+      .prepare(
+        `SELECT *
+         FROM opportunities
+         WHERE status IN ('active', 'unverified')
+           AND last_seen_at >= ?
+           AND (deadline_at IS NULL OR deadline_at >= ?)
+         ORDER BY
+           CASE status WHEN 'active' THEN 0 ELSE 1 END,
+           CASE section WHEN 'cex' THEN 0 ELSE 1 END,
+           CASE type
+             WHEN 'stablecoin_earn' THEN 0
+             WHEN 'pre_ipo' THEN 1
+             WHEN 'launch' THEN 2
+             WHEN 'short_term' THEN 3
+             ELSE 4
+           END,
+           COALESCE(apy, 0) DESC,
+           last_seen_at DESC
+         LIMIT 200`
+      )
+      .all(staleThreshold, nowIso)
+      .map((row) => ({
+        ...row,
+        apy: row.apy === null || row.apy === undefined ? null : Number(row.apy)
+      }));
+  }
+
+  getLatestOpportunityRun() {
+    const row = this.db
+      .prepare(
+        `SELECT id, started_at, finished_at, status, duration_ms, error, item_count, job_stats
+         FROM opportunity_runs
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+      .get();
+    if (!row) return null;
+    return { ...row, job_stats: safeParseJson(row.job_stats || "[]", []) };
+  }
+
+  getOpportunityRuns(limit = 10) {
+    return this.db
+      .prepare(
+        `SELECT id, started_at, finished_at, status, duration_ms, error, item_count, job_stats
+         FROM opportunity_runs
+         ORDER BY id DESC
+         LIMIT ?`
+      )
+      .all(Math.max(1, Math.min(50, Number(limit || 10))))
+      .map((row) => ({ ...row, job_stats: safeParseJson(row.job_stats || "[]", []) }));
   }
 
   getCachedXUserId(username) {

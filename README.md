@@ -42,7 +42,7 @@ npm start
 ## 关键配置
 - `POLL_INTERVAL_SEC=180`
 - `APP_PORT=3100`
-- `LEVEL2_THRESHOLD=50`
+- `LEVEL2_THRESHOLD=60`
 - `X_LEVEL2_THRESHOLD_LOWER_FOR_X=10`（X 来源 Level2 阈值额外降低 10）
 - `LEVEL3_THRESHOLD=75`
 - `MARKET_CONFIRM_STRONG=70`
@@ -65,19 +65,44 @@ npm start
 - `X_EXCLUDE_RETWEETS_REPLIES=true`
 - `TELEGRAM_MODE=relay`
 - `TELEGRAM_SERVICE_URL=http://127.0.0.1:3000`
-- `TELEGRAM_API_KEY=...`
+- `TELEGRAM_API_KEY=[REDACTED]`
 - `DAILY_REPORT_ENABLED=true`
 - `DAILY_REPORT_TIME_BJ=16:43`
 - `DAILY_REPORT_CHECK_INTERVAL_SEC=30`
 - `DAILY_REPORT_MAX_EVENTS=5`
 - `DAILY_REPORT_MESSAGE_MAX_CHARS=1200`
+- `OPPORTUNITY_MONITOR_ENABLED=true`
+- `OPPORTUNITY_INTERVAL_SEC=900`
+- `OPPORTUNITY_HERMES_BIN=hermes`
+- `OPPORTUNITY_HERMES_PROFILE=xintel`
+- `OPPORTUNITY_HERMES_TIMEOUT_SEC=240`
+- `OPPORTUNITY_LOOKBACK_HOURS=72`
+- `OPPORTUNITY_STALE_AFTER_HOURS=96`
+- `OPPORTUNITY_MAX_FOLLOWUPS=3`
+- `OPPORTUNITY_FOCUSED_QUERIES_ENABLED=true`（额外执行 Gate/SpaceX 和链上/DEX 专题查询，减少主查询漏项）
+- `OPPORTUNITY_QUERY_MATRIX_ENABLED=true`（按 CEX × 类别拆分专题查询）
+- `OPPORTUNITY_ADAPTIVE_QUERY_PLAN_ENABLED=true`（主查询超时后，下一轮自动降级为更小的专题查询）
+- `OPPORTUNITY_MAX_QUERY_JOBS=5`（每轮最多执行的 xintel 查询数，防止 15 分钟任务重叠）
+- `OPPORTUNITY_ENRICHMENT_ENABLED=true`（搜索后补全官方公告链接和截止时间）
+- `OPPORTUNITY_ENRICHMENT_MAX_ITEMS=5`
+- `OPPORTUNITY_EXISTING_ENRICHMENT_MAX_ITEMS=2`（每轮额外补查旧机会的官方链接/截止信息）
+- `OPPORTUNITY_ENRICHMENT_RETRY_COOLDOWN_HOURS=12`（补查无结果后多久再重试）
+- `OPPORTUNITY_OFFICIAL_CRAWL_TIMEOUT_SEC=15`
+- `OPPORTUNITY_GROK_DEADLINE_FALLBACK_ENABLED=true`
+- `OPPORTUNITY_GROK_DEADLINE_FALLBACK_MAX=2`
 - `SUPPRESS_KEYWORDS_FILE=./config/suppress_keywords.txt`
+- `ENABLE_TRADINGVIEW_WEBHOOK=true`
+- `TRADINGVIEW_WEBHOOK_SECRET=[REDACTED]`（启用 TradingView webhook 时必须配置；为空或未配置会 fail-closed 拒绝请求，返回 `webhook_secret_missing`）
 
 ## 接口
 - `GET /status.json`
 - `GET /health`
+- `GET /opportunities`（xintel/Grok 高收益机会监控网页）
+- `GET /api/opportunities`
+- `GET /api/opportunities/runs/latest`
 - `POST /webhook/tradingview`
-  - Header: `x-tradingview-secret: <TRADINGVIEW_WEBHOOK_SECRET>`
+  - Header: `x-tradingview-secret: [REDACTED]`
+  - 当 `ENABLE_TRADINGVIEW_WEBHOOK=true` 但 `TRADINGVIEW_WEBHOOK_SECRET` 为空或未配置时，请求会 fail-closed 拒绝，当前返回 `webhook_secret_missing`。
   - Body 示例：
 ```json
 {
