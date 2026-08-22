@@ -3,17 +3,13 @@ import { parseMaxApyPercent } from "./opportunityUtils.js";
 export const CEX_EXCHANGES = ["Binance", "OKX", "Bybit", "Gate", "Bitget"];
 
 export const CEX_CATEGORIES = [
-  { id: "stablecoin_earn", label: "稳定币理财" },
   { id: "launch", label: "打新" },
-  { id: "pre_ipo", label: "Pre-IPO" },
-  { id: "short_term", label: "短期活动" }
+  { id: "pre_tge", label: "Pre-TGE" }
 ];
 
 export const CEX_GAP_QUERIES = {
-  stablecoin_earn: "USDT OR USDC OR USD1 Earn APR APY boosted limited-time >=8",
   launch: "Launchpad Launchpool IEO IDO Farm airdrop task official",
-  pre_ipo: "Pre-IPO Pre-token Pre-listing SpaceX xStocks pre-market IPO Access",
-  short_term: "trading competition leaderboard points boost double rewards wallet campaign"
+  pre_tge: "Pre-TGE token generation whitelist points snapshot community sale pre-market official"
 };
 
 export function buildCexCoverage(items = []) {
@@ -60,7 +56,7 @@ export function buildCexCoverage(items = []) {
       row.cells
         .filter((cell) => cell.status === "missing")
         .map((cell) => {
-          const categoryPriority = ["stablecoin_earn", "pre_ipo"].includes(cell.type) ? 2 : 1;
+          const categoryPriority = cell.type === "pre_tge" ? 2 : 1;
           const emptyExchangePriority = row.total === 0 ? 2 : 0;
           const priorityScore = categoryPriority + emptyExchangePriority;
           return {

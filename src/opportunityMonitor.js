@@ -1,11 +1,11 @@
-﻿import { execFile } from "node:child_process";
-import { logger } from "./logger.js";
+﻿import { logger } from "./logger.js";
+import { HermesClient } from "./hermesClient.js";
 import { buildCexCoverage } from "./opportunityAnalytics.js";
 import { enrichOpportunities } from "./opportunityEnrichment.js";
 import { normalizeOpportunityBatchWithReport, parseXintelOpportunities } from "./opportunityUtils.js";
 
 const OUTPUT_SCHEMA =
-  '{"generated_at":"ISO","opportunities":[{"activity_name":"","type":"launch|pre_ipo|short_term|stablecoin_earn|onchain","section":"cex|onchain","exchange":"Binance|OKX|Bybit|Gate|Bitget|","venue":"","asset":"","stablecoin":"USDT|USDC|USD1|","apy":null,"expected_yield":"","reward":"","duration":"","deadline_at":null,"deadline_text":"","deadline_source":"x_post|official_page|grok|no_fixed_deadline|unverified","deadline_confidence":0,"official_url":"https://...","source_published_at":null,"participation":"","source_user":"@","source_url":"https://x.com/.../status/...","credibility":"official|kol|unverified","risk_note":""}]}';
+  '{"generated_at":"ISO","opportunities":[{"activity_name":"","type":"launch|pre_tge|pre_ipo|short_term|stablecoin_earn|onchain","section":"cex|onchain","exchange":"Binance|OKX|Bybit|Gate|Bitget|","venue":"","asset":"","stablecoin":"USDT|USDC|USD1|","apy":null,"expected_yield":"","reward":"","duration":"","deadline_at":null,"deadline_text":"","deadline_source":"x_post|official_page|grok|no_fixed_deadline|unverified","deadline_confidence":0,"official_url":"https://...","source_published_at":null,"participation":"","source_user":"@","source_url":"https://x.com/.../status/...","credibility":"official|kol|unverified","risk_note":""}]}';
 
 const FIELD_RULES = `
 字段硬要求：
@@ -15,7 +15,8 @@ const FIELD_RULES = `
 - deadline_at 能确认必须填 UTC ISO；deadline_text 保留原始截止/活动期文本；deadline_source 标 official_page/x_post/grok。
 - 官方说明“长期/持续中/无固定截止”时 deadline_source="no_fixed_deadline"，deadline_at=null。
 - 不能确认固定截止时间时 deadline_source="unverified"，不要把“截止未知”当成 duration 或 deadline_text 的有效证据。
-- 稳定币理财的 apy 只填普通用户可入库/可持续认购的 APY；如果有新户、限额、限时促销最高 APY，写进 expected_yield/reward/duration，并说明新户/限额/地区/期限条件，不要只返回最高宣传值。
+- 稳定币理财的 apy 只填普通用户/老用户可入库或可持续认购的 APY；新户专属 APY 不要填入 apy，只能写进 expected_yield/reward/duration，并明确标注新户限定、限额、地区和期限条件。
+- activity_name 尽量使用官方标准活动名或产品名；同一活动被不同来源提到时不要改写成多个新名称，保留各自 source_url/source_user 即可，后端会按平台、活动机制、资产/主题做分析去重。
 - participation 写成中文步骤，至少说明入口、资产、认购/交易/锁仓动作；有官方入口时写清入口名称。
 - risk_note 用中文，必须提示地区限制、额度、锁仓/赎回、交易/合约、链上合约或对手方风险。
 `.trim();
@@ -25,7 +26,9 @@ const QUERY_JOB_LABELS = {
   gate_spacex: "Gate/SpaceX 专题",
   cex_coverage_gaps: "CEX 覆盖缺口补查",
   cex_pre_ipo: "CEX Pre-IPO 专题",
+  pre_tge: "Pre-TGE 专题",
   cex_launch: "CEX 打新专题",
+  onchain_launch: "链上打新专题",
   cex_stablecoin_earn: "CEX 稳定币理财专题",
   cex_short_term: "CEX 短期活动专题",
   onchain_stablecoin: "链上稳定币收益专题",
@@ -37,6 +40,12 @@ function clampInt(value, min, max, fallback) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, parsed));
+}
+
+function configuredCollectionTypes(config) {
+  return Array.isArray(config.opportunityCollectionTypes)
+    ? config.opportunityCollectionTypes.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)
+    : [];
 }
 
 function buildSearchPrompt(config) {
@@ -87,7 +96,8 @@ ${FIELD_RULES}
 function buildCexLaunchPrompt(config) {
   const lookbackHours = clampInt(config.opportunityLookbackHours, 24, 72, 72);
   return `
-用 X/Grok 做 CEX × 打新专题搜索，范围是过去 ${lookbackHours} 小时。只限 Binance、OKX、Bybit、Gate、Bitget 官方 Launchpad/Launchpool/Startup/IEO/IDO/Farm/任务活动，每家最多 2 条。
+用 X/Grok 做 CEX × 打新专题搜索，范围是过去 ${lookbackHours} 小时。只限 Binance、OKX、Bybit、Gate、Bitget 官方 Launchpad/Launchpool/Startup/IEO/IDO/Farm/任务活动，每家最多 1 条。
+工具约束：只使用 x_search，最多调用 3 次；不要调用 web_extract、browser、terminal、skill 或 todo，也不要再次打开 x.com 链接。直接依据 x_search 返回的正文和元数据判断；证据不足时返回空 opportunities，不要继续搜索。
 关键词矩阵：
 - Binance: Launchpool, Megadrop, HODLer Airdrops, Wallet campaign, Alpha airdrop
 - OKX: Jumpstart, Cryptopedia, Giveaway, new listing campaign
@@ -99,6 +109,39 @@ function buildCexLaunchPrompt(config) {
 ${OUTPUT_SCHEMA}
 ${FIELD_RULES}
 除专有名词、交易所名、币种、URL 外，activity_name/expected_yield/reward/duration/participation/risk_note 必须使用简体中文。
+`.trim();
+}
+
+function buildPreTgePrompt(config) {
+  const lookbackHours = clampInt(config.opportunityLookbackHours, 24, 72, 24);
+  return `
+用 X/Grok 做 Pre-TGE 专题搜索，范围是过去 ${lookbackHours} 小时，最多返回 6 条。只收代币生成事件（TGE）之前、普通用户仍可参与且尚未过期的明确机会。
+工具约束：只使用 x_search，最多调用 3 次；不要调用 web_extract、browser、terminal、skill 或 todo，也不要再次打开 x.com 链接。直接依据 x_search 返回的正文和元数据判断；证据不足时返回空 opportunities，不要继续搜索。
+必须覆盖：
+- 项目官方 Pre-TGE 活动、白名单、积分或空投快照、社区销售、预存款、测试网任务、早期参与活动。
+- Binance、OKX、Bybit、Gate、Bitget 的 Pre-market/Pre-token/Pre-listing，以及与即将 TGE 代币直接相关的官方活动。
+- 优先项目官方账号、交易所官方账号；可靠 KOL 只能作为补充来源。
+排除：已完成 TGE、仅价格预测、纯融资新闻、Pre-IPO 股票、永续合约、无参与入口、无 X 来源或无法判断时效的内容。
+所有条目 type="pre_tge"。CEX 活动 section="cex" 并填写目标交易所；项目原生活动 section="onchain"、exchange=""，venue 填项目名或活动平台。
+必须写清预计 TGE/截止时间、参与步骤、资格门槛、奖励或份额，以及锁仓、地区、女巫过滤和合约风险。只输出 JSON，不要解释：
+${OUTPUT_SCHEMA}
+${FIELD_RULES}
+除专有名词、交易所名、币种、URL 外，activity_name/expected_yield/reward/duration/participation/risk_note 必须使用简体中文。
+`.trim();
+}
+
+function buildOnchainLaunchPrompt(config) {
+  const lookbackHours = clampInt(config.opportunityLookbackHours, 24, 72, 24);
+  return `
+用 X/Grok 搜索链上和非 CEX 的代币打新机会。重点搜索过去 ${lookbackHours} 小时新公告或有实质更新的活动，同时补查最近 14 天开始且当前仍可注册、KYC、申购或承诺资金的公开销售。
+必须覆盖：Sonar/Echo、Legion、CoinList、Fjord Foundry、Impossible Finance、DAO Maker、Republic、Galxe，以及项目官方自建 presale/community sale/public sale/IDO/ICO/LBP/auction/whitelist 页面。不要只搜索中心化交易所。
+工具约束：只使用 x_search，最多调用 3 次；不要调用 web_extract、browser、terminal、skill 或 todo，也不要再次打开 x.com 链接。直接依据 x_search 返回的正文和元数据判断；证据不足时返回空 opportunities，不要继续搜索。
+只收普通用户当前仍有明确参与动作的活动；排除已结束、仅候补登记、仅交易所上币、纯空投传闻、没有官方来源或无法确认参与入口的内容。若原始公告超过 ${lookbackHours} 小时，仅在能确认 deadline_at 仍在未来时返回。
+所有条目 type="launch"、section="onchain"、exchange=""；venue 填销售平台或项目官方销售页，asset 填代币符号。必须写清支付资产、链、KYC/地区限制、估值或价格（如公开）、额度、解锁/退款规则、截止时间和参与步骤。
+只输出 JSON，不要解释：
+${OUTPUT_SCHEMA}
+${FIELD_RULES}
+除专有名词、平台名、币种、URL 外，activity_name/expected_yield/reward/duration/participation/risk_note 必须使用简体中文。
 `.trim();
 }
 
@@ -196,6 +239,18 @@ function latestJobTimedOut(latestRun, jobName) {
   });
 }
 
+function isAllEmptyResponseError(detail) {
+  const parts = String(detail || "")
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return parts.length > 0 && parts.every((part) => /xintel_parse_failed:empty_response/i.test(part));
+}
+
+function isQuotaError(detail) {
+  return /personal-team-blocked|spending-limit|run out of credits|need a grok subscription/i.test(String(detail || ""));
+}
+
 function buildQueryAdaptations(config, latestRun) {
   const adaptations = [];
   const skipMain =
@@ -223,12 +278,15 @@ function rotateJobs(jobs, limit, offset) {
 }
 
 function buildSearchPrompts(config, rotationOffset = 0, currentItems = [], queryContext = {}) {
-  const maxJobs = clampInt(
-    config.opportunityMaxQueryJobs,
-    1,
-    20,
-    config.opportunityQueryMatrixEnabled ? 5 : 3
-  );
+  const maxJobs = clampInt(config.opportunityMaxQueryJobs, 1, 20, 3);
+  const collectionTypes = configuredCollectionTypes(config);
+  if (collectionTypes.length > 0) {
+    const jobs = [];
+    if (collectionTypes.includes("launch")) jobs.push({ name: "cex_launch", prompt: buildCexLaunchPrompt(config) });
+    if (collectionTypes.includes("launch")) jobs.push({ name: "onchain_launch", prompt: buildOnchainLaunchPrompt(config) });
+    if (collectionTypes.includes("pre_tge")) jobs.push({ name: "pre_tge", prompt: buildPreTgePrompt(config) });
+    return jobs.slice(0, maxJobs);
+  }
   const prompts = queryContext.skipMain ? [] : [{ name: "main", prompt: buildSearchPrompt(config) }];
 
   if (config.opportunityFocusedQueriesEnabled && prompts.length < maxJobs) {
@@ -236,7 +294,7 @@ function buildSearchPrompts(config, rotationOffset = 0, currentItems = [], query
   }
 
   const coverageGapJob = buildCoverageGapJob(config, currentItems);
-  if (coverageGapJob && prompts.length < maxJobs) {
+  if (coverageGapJob && prompts.length + 1 < maxJobs) {
     prompts.push(coverageGapJob);
   }
 
@@ -332,29 +390,34 @@ function needsFollowup(item) {
   if (!item) return false;
   if (!item.source_url || !item.source_user) return true;
   if (item.type === "stablecoin_earn" && (!Number.isFinite(item.apy) || !item.deadline_at)) return true;
-  if ((item.type === "launch" || item.type === "pre_ipo") && !item.deadline_at) return true;
+  if ((item.type === "launch" || item.type === "pre_ipo" || item.type === "pre_tge") && !item.deadline_at) return true;
   return false;
 }
 
 export class OpportunityMonitor {
-  constructor({ config, db }) {
+  constructor({ config, db, hermesClient }) {
     this.config = config;
     this.db = db;
+    this.hermesClient = hermesClient || new HermesClient(config, { minIntervalMs: 0 });
     this.isRunning = false;
     this.timer = null;
     this.nextRunAt = null;
     this.lastStartedAt = null;
     this.lastFinishedAt = null;
     this.lastError = "";
+    this.emptyResponsePausedUntil = null;
+    this.pauseReason = "";
   }
 
   getStatus() {
+    const pausedUntil = this.emptyResponsePausedUntil;
     return {
       enabled: Boolean(this.config.opportunityMonitorEnabled),
       running: this.isRunning,
       last_started_at: this.lastStartedAt,
       last_finished_at: this.lastFinishedAt,
-      next_run_at: this.nextRunAt,
+      next_run_at: pausedUntil || this.nextRunAt,
+      paused_until: pausedUntil,
       last_error: this.lastError
     };
   }
@@ -368,9 +431,11 @@ export class OpportunityMonitor {
     return {
       enabled: Boolean(this.config.opportunityMonitorEnabled),
       running: this.isRunning,
+      schedule_mode: this.config.opportunityScheduleMode || "interval",
+      daily_time_bj: this.config.opportunityDailyReportTimeBj || null,
       interval_sec: Number(this.config.opportunityIntervalSec || 0),
       lookback_hours: Number(this.config.opportunityLookbackHours || 72),
-      max_jobs: clampInt(this.config.opportunityMaxQueryJobs, 1, 20, this.config.opportunityQueryMatrixEnabled ? 5 : 3),
+      max_jobs: clampInt(this.config.opportunityMaxQueryJobs, 1, 20, 3),
       job_count: jobs.length,
       adaptive: Boolean(this.config.opportunityAdaptiveQueryPlanEnabled),
       adaptations: queryContext.adaptations,
@@ -379,38 +444,11 @@ export class OpportunityMonitor {
   }
 
   async callHermes(prompt) {
-    const timeoutMs = clampInt(this.config.opportunityHermesTimeoutSec, 10, 600, 120) * 1000;
-    return new Promise((resolve, reject) => {
-      execFile(
-        this.config.opportunityHermesBin || "hermes",
-        ["--profile", this.config.opportunityHermesProfile || "xintel", "-z", prompt],
-        {
-          timeout: timeoutMs,
-          maxBuffer: 2 * 1024 * 1024,
-          windowsHide: true
-        },
-        (error, stdout, stderr) => {
-          const output = String(stdout || "").trim();
-          const errorOutput = String(stderr || "").trim();
-          if (error) {
-            const isTimeout = error.killed || error.signal === "SIGTERM";
-            const detail = isTimeout
-              ? `hermes_timeout_after_${timeoutMs}ms`
-              : `hermes_failed:${error.code || error.signal || "unknown"}`;
-            const wrapped = new Error(detail);
-            wrapped.stdout = output;
-            wrapped.stderr = errorOutput;
-            reject(wrapped);
-            return;
-          }
-          resolve(output || errorOutput);
-        }
-      );
-    });
+    return this.hermesClient.call(prompt);
   }
 
   async hydrateCandidates(items) {
-    const maxFollowups = clampInt(this.config.opportunityMaxFollowups, 0, 10, 3);
+    const maxFollowups = clampInt(this.config.opportunityMaxFollowups, 0, 10, 1);
     if (maxFollowups <= 0) return items;
 
     const hydrated = [...items];
@@ -449,7 +487,7 @@ export class OpportunityMonitor {
         ...this.config,
         opportunityEnrichmentMaxItems: limit,
         opportunityGrokDeadlineFallbackMax: Math.min(
-          clampInt(this.config.opportunityGrokDeadlineFallbackMax, 0, 10, 2),
+          clampInt(this.config.opportunityGrokDeadlineFallbackMax, 0, 10, 1),
           1
         )
       },
@@ -463,6 +501,14 @@ export class OpportunityMonitor {
 
   async runOnce(trigger = "timer") {
     if (!this.config.opportunityMonitorEnabled) return { skipped: true, reason: "disabled" };
+    if (this.emptyResponsePausedUntil && Date.parse(this.emptyResponsePausedUntil) > Date.now()) {
+      this.nextRunAt = this.emptyResponsePausedUntil;
+      return {
+        skipped: true,
+        reason: this.pauseReason || "xintel_empty_response_backoff",
+        until: this.emptyResponsePausedUntil
+      };
+    }
     if (this.isRunning) return { skipped: true, reason: "already_running" };
 
     this.isRunning = true;
@@ -539,18 +585,31 @@ export class OpportunityMonitor {
             saved_count: 0,
             error: detail
           });
+          if (isQuotaError(detail)) {
+            const backoffSec = clampInt(this.config.opportunityQuotaErrorBackoffSec, 0, 7 * 86400, 43200);
+            if (backoffSec > 0) {
+              this.emptyResponsePausedUntil = new Date(Date.now() + backoffSec * 1000).toISOString();
+              this.pauseReason = "xintel_quota_error_backoff";
+              this.nextRunAt = this.emptyResponsePausedUntil;
+            }
+            break;
+          }
         }
       }
 
       raw = rawParts.join("\n\n");
-      if (candidates.length === 0) {
-        throw new Error(errors.length ? errors.join("; ") : "xintel_no_candidates");
+      if (candidates.length === 0 && errors.length > 0) {
+        throw new Error(errors.join("; "));
       }
 
       const hydrated = await this.hydrateCandidates(candidates);
-      const { items: normalizedItems, report: normalizeReport } = normalizeOpportunityBatchWithReport(hydrated, new Date(), {
+      const { items: allNormalizedItems, report: normalizeReport } = normalizeOpportunityBatchWithReport(hydrated, new Date(), {
         lookbackHours: this.config.opportunityLookbackHours
       });
+      const collectionTypes = configuredCollectionTypes(this.config);
+      const normalizedItems = collectionTypes.length
+        ? allNormalizedItems.filter((item) => collectionTypes.includes(item.type))
+        : allNormalizedItems;
       const items = await enrichOpportunities(normalizedItems, {
         config: this.config,
         callHermes: this.callHermes.bind(this)
@@ -563,6 +622,8 @@ export class OpportunityMonitor {
       this.db.markExpiredOpportunities?.(new Date().toISOString());
 
       const durationMs = Date.now() - startedMs;
+      this.emptyResponsePausedUntil = null;
+      this.pauseReason = "";
       this.db.finishOpportunityRun?.(runId, {
         status: errors.length ? "partial" : "ok",
         durationMs,
@@ -587,6 +648,21 @@ export class OpportunityMonitor {
         raw = [error.stdout, error.stderr].filter(Boolean).join("\n").trim();
       }
       this.lastError = detail;
+      if (isAllEmptyResponseError(detail)) {
+        const backoffSec = clampInt(this.config.opportunityEmptyResponseBackoffSec, 0, 86400, 3600);
+        if (backoffSec > 0) {
+          this.emptyResponsePausedUntil = new Date(Date.now() + backoffSec * 1000).toISOString();
+          this.pauseReason = "xintel_empty_response_backoff";
+          this.nextRunAt = this.emptyResponsePausedUntil;
+        }
+      } else if (isQuotaError(detail)) {
+        const backoffSec = clampInt(this.config.opportunityQuotaErrorBackoffSec, 0, 7 * 86400, 43200);
+        if (backoffSec > 0) {
+          this.emptyResponsePausedUntil = new Date(Date.now() + backoffSec * 1000).toISOString();
+          this.pauseReason = "xintel_quota_error_backoff";
+          this.nextRunAt = this.emptyResponsePausedUntil;
+        }
+      }
       this.db.finishOpportunityRun?.(runId, {
         status: "error",
         durationMs,
@@ -606,7 +682,7 @@ export class OpportunityMonitor {
 
   start() {
     if (!this.config.opportunityMonitorEnabled || this.timer) return;
-    const intervalSec = clampInt(this.config.opportunityIntervalSec, 60, 86400, 900);
+    const intervalSec = clampInt(this.config.opportunityIntervalSec, 60, 86400, 21600);
     this.nextRunAt = new Date(Date.now() + intervalSec * 1000).toISOString();
     this.runOnce("startup").catch((error) => {
       logger.warn("opportunity_monitor_startup_failed", { error: String(error.message || error) });

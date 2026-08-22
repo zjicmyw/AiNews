@@ -4,6 +4,10 @@ import { MarketModule } from "./market/index.js";
 import { RiskEngine } from "./riskEngine.js";
 import { TelegramNotifier } from "./notifier/telegram.js";
 import { OpportunityMonitor } from "./opportunityMonitor.js";
+import { SecurityIncidentMonitor } from "./securityIncidentMonitor.js";
+import { BinanceMajorNewsMonitor } from "./binanceMajorNewsMonitor.js";
+import { BinanceMajorNewsMarketMetrics } from "./binanceMajorNewsMarketMetrics.js";
+import { HermesClient } from "./hermesClient.js";
 import { logger } from "./logger.js";
 import { readLines } from "./utils.js";
 
@@ -61,6 +65,12 @@ function publishToPushLatencySec(publishTimeIso) {
   return Math.max(0, Math.floor((Date.now() - ts) / 1000));
 }
 
+function compactLine(value, maxLength = 160) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(1, maxLength - 1))}…`;
+}
+
 export class EnginePipeline {
   constructor({ config, db, tradingViewSignalStore }) {
     this.config = config;
@@ -70,7 +80,11 @@ export class EnginePipeline {
     this.marketModule = new MarketModule(config, tradingViewSignalStore);
     this.riskEngine = new RiskEngine(config, db);
     this.notifier = new TelegramNotifier(config);
-    this.opportunityMonitor = new OpportunityMonitor({ config, db });
+    this.hermesClient = new HermesClient(config);
+    this.opportunityMonitor = new OpportunityMonitor({ config, db, hermesClient: this.hermesClient });
+    this.binanceMajorNewsMonitor = new BinanceMajorNewsMonitor({ config, hermesClient: this.hermesClient });
+    this.binanceMajorNewsMarketMetrics = new BinanceMajorNewsMarketMetrics({ config });
+    this.securityIncidentMonitor = new SecurityIncidentMonitor({ config, db, notifier: this.notifier, hermesClient: this.hermesClient });
     this.runtimeStatus = {
       regime: "Neutral",
       regime_probability: 50,
@@ -84,6 +98,12 @@ export class EnginePipeline {
     this.suppressKeywords = readLines(config.suppressKeywordsFile).map((k) => k.toLowerCase());
     this.dailySchedule = parseSchedule(config.dailyReportTimeBj);
     this.dailyReportInFlight = false;
+    this.opportunityDailySchedule = parseSchedule(config.opportunityDailyReportTimeBj || config.dailyReportTimeBj);
+    this.opportunityDailyReportInFlight = false;
+    this.binanceMajorNewsCollectionSchedule = parseSchedule(config.binanceMajorNewsCollectionTimeBj || "18:15");
+    this.binanceMajorNewsSchedule = parseSchedule(config.binanceMajorNewsDailyTimeBj || "19:01");
+    this.binanceMajorNewsCollectionInFlight = false;
+    this.binanceMajorNewsInFlight = false;
   }
 
   getRuntimeStatus() {
@@ -96,6 +116,20 @@ export class EnginePipeline {
 
   getOpportunityQueryPlan() {
     return this.opportunityMonitor.getQueryPlan();
+  }
+
+  getSecurityIncidentStatus() {
+    return this.securityIncidentMonitor.getStatus();
+  }
+
+  shouldRunNewsCycle() {
+    if (!this.config.enableEngineCycle) return false;
+    return Boolean(
+      this.config.enableRssSource ||
+        this.config.enableGdeltSource ||
+        this.config.enableXSource ||
+        this.config.enableMarketConfirmation
+    );
   }
 
   shouldAnalyze(event) {
@@ -195,6 +229,290 @@ export class EnginePipeline {
     return message;
   }
 
+  buildOpportunityDailyReportMessage(reportDate, items, collectionResult = {}) {
+    const rows = Array.isArray(items) ? items : [];
+    const launchCount = rows.filter((item) => item.type === "launch").length;
+    const preTgeCount = rows.filter((item) => item.type === "pre_tge").length;
+    const lines = [
+      `【每日打新 / Pre-TGE 日报】${reportDate}（北京时间）`,
+      `采集范围：过去 ${this.config.opportunityLookbackHours || 24} 小时 | 打新 ${launchCount} | Pre-TGE ${preTgeCount}`
+    ];
+
+    if (collectionResult?.ok === false) {
+      lines.push(`采集状态：异常（${compactLine(collectionResult.error || "未知错误", 120)}）`);
+    } else if (collectionResult?.partial) {
+      lines.push("采集状态：部分查询成功，请以来源链接为准");
+    } else {
+      lines.push("采集状态：完成");
+    }
+
+    if (rows.length === 0) {
+      lines.push("", "今日未发现符合条件且仍可参与的新机会。");
+      return lines.join("\n");
+    }
+
+    rows.forEach((item, index) => {
+      const label = item.type === "pre_tge" ? "Pre-TGE" : "打新";
+      const venue = item.exchange || item.venue || "未注明平台";
+      const deadline = item.deadline_text || item.deadline_at || "截止时间待核验";
+      const reward = item.reward || item.expected_yield || "奖励待核验";
+      lines.push(
+        "",
+        `${index + 1}. [${label}] ${compactLine(item.activity_name, 90)}`,
+        `平台：${compactLine(venue, 60)} | 截止：${compactLine(deadline, 100)}`,
+        `奖励：${compactLine(reward, 140)}`,
+        `参与：${compactLine(item.participation || "请查看官方活动说明", 180)}`,
+        `来源：${item.official_url || item.source_url || "待核验"}`
+      );
+    });
+
+    let message = lines.join("\n");
+    const maxChars = Math.max(500, Number(this.config.opportunityDailyReportMaxChars || 3500));
+    if (message.length > maxChars) message = `${message.slice(0, maxChars - 1)}…`;
+    return message;
+  }
+
+  async maybeSendOpportunityDailyReport(trigger = "timer") {
+    if (!this.config.opportunityDailyReportEnabled || this.opportunityDailyReportInFlight) return;
+    this.opportunityDailyReportInFlight = true;
+
+    try {
+      const now = new Date();
+      const bj = getTimeParts(now, BJ_TIMEZONE);
+      const shouldSendNow =
+        bj.hour > this.opportunityDailySchedule.hour ||
+        (bj.hour === this.opportunityDailySchedule.hour && bj.minute >= this.opportunityDailySchedule.minute);
+      if (!shouldSendNow) return;
+
+      const dateKey = beijingDateKey(now);
+      const reportKey = `opportunity:${dateKey}`;
+      if (this.db.hasDailyReportSent?.(reportKey)) return;
+
+      const startIso = beijingDayStartUtcIso(dateKey);
+      const endIso = now.toISOString();
+      let collectionResult = { skipped: true, reason: "already_collected" };
+      if (!this.db.hasOpportunityRunSince?.(startIso, endIso)) {
+        collectionResult = await this.opportunityMonitor.runOnce("daily_report");
+      }
+
+      const collectionTypes = Array.isArray(this.config.opportunityCollectionTypes)
+        ? this.config.opportunityCollectionTypes
+        : ["launch", "pre_tge"];
+      const items = this.db.getOpportunitiesSeenSince?.(
+        startIso,
+        new Date().toISOString(),
+        collectionTypes,
+        this.config.opportunityDailyReportMaxItems
+      ) || [];
+      const message = this.buildOpportunityDailyReportMessage(dateKey, items, collectionResult);
+      const sendResult = await this.notifier.send({
+        message,
+        chatId: this.config.opportunityDailyReportChatId || this.config.dailyReportChatId
+      });
+      if (!sendResult.ok) {
+        logger.warn("opportunity_daily_report_send_failed", { trigger, dateKey, reason: sendResult.reason });
+        return;
+      }
+
+      this.db.saveDailyReport?.({
+        reportDate: reportKey,
+        timezone: BJ_TIMEZONE,
+        scheduledTime: this.opportunityDailySchedule.text,
+        payload: {
+          mode: "launch_pre_tge",
+          collection_result: collectionResult,
+          item_count: items.length,
+          types: collectionTypes
+        }
+      });
+      logger.info("opportunity_daily_report_sent", {
+        trigger,
+        date: dateKey,
+        items: items.length,
+        launch: items.filter((item) => item.type === "launch").length,
+        pre_tge: items.filter((item) => item.type === "pre_tge").length
+      });
+    } catch (error) {
+      logger.warn("opportunity_daily_report_failed", { trigger, error: String(error.message || error) });
+    } finally {
+      this.opportunityDailyReportInFlight = false;
+    }
+  }
+
+  buildBinanceMajorNewsMessages(reportDate, result) {
+    const nowMs = Date.now();
+    const recent = (result.items || []).filter((item) => nowMs - Date.parse(item.published_at) <= 48 * 60 * 60 * 1000);
+    const fallback = (result.items || []).filter((item) => nowMs - Date.parse(item.published_at) > 48 * 60 * 60 * 1000);
+    const statusText = result.status === "ok" ? "完成" : result.status === "partial" ? "部分批次异常" : "异常";
+    const header = [
+      `【Binance 已上线代币重大消息日报】${reportDate}（北京时间）`,
+      `覆盖：${result.universeCount || 0} 个项目代币 | 采集状态：${statusText}`
+    ];
+    const blocks = [];
+
+    if (result.status === "error") {
+      blocks.push(`采集失败：${compactLine(result.error || "未知错误", 220)}`);
+    } else if (recent.length === 0) {
+      blocks.push("今日无重大消息（近 2 天）");
+    } else {
+      blocks.push(`近 2 天重大消息：${recent.length} 条`);
+    }
+
+    const marketCapText = (value) => {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return "暂无可靠数据";
+      if (number >= 100000000) return `约 ${(number / 100000000).toFixed(2)} 亿美元`;
+      if (number >= 10000) return `约 ${(number / 10000).toFixed(2)} 万美元`;
+      return `约 ${number.toFixed(0)} 美元`;
+    };
+    const changeText = (value) => {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return "暂无可靠数据";
+      return `${number >= 0 ? "+" : ""}${number.toFixed(2)}%`;
+    };
+    const priceText = (value) => {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return "暂无可靠数据";
+      if (number >= 1000) return `$${number.toFixed(2)}`;
+      if (number >= 1) return `$${number.toFixed(4)}`;
+      if (number >= 0.01) return `$${number.toFixed(6)}`;
+      return `$${number.toFixed(8)}`;
+    };
+    const formatItem = (item, index) => [
+      `${index + 1}. ${item.token_name}/${item.symbol}`,
+      `综合评分：${item.score}/10`,
+      `消息核心内容：${item.summary_zh}`,
+      `流通市值：${marketCapText(item.circulating_market_cap_usd)} | 当前价：${priceText(item.current_price_usd)} | 24h 涨跌幅：${changeText(item.price_change_percentage_24h)}`,
+      `发布时间：${new Date(item.published_at).toLocaleString("zh-CN", { timeZone: BJ_TIMEZONE, hour12: false })}（北京时间）`,
+      `来源账号：${item.source_account} | ${item.source_url}`
+    ].join("\n");
+
+    recent.forEach((item, index) => blocks.push(formatItem(item, index)));
+    if (fallback.length > 0) {
+      blocks.push(`近 3-5 天补充：${fallback.length} 条`);
+      fallback.forEach((item, index) => blocks.push(formatItem(item, recent.length + index)));
+    }
+    if (result.status === "partial") {
+      const failed = (result.diagnostics || []).filter((item) => item.status === "error").length;
+      blocks.push(`注：${failed} 个检索批次异常，本期结果不代表完整覆盖。`);
+    }
+
+    const maxChars = Math.max(1000, Number(this.config.binanceMajorNewsMessageMaxChars || 3800));
+    const messages = [];
+    let current = header.join("\n");
+    for (const block of blocks) {
+      const candidate = `${current}\n\n${block}`;
+      if (candidate.length <= maxChars) {
+        current = candidate;
+      } else {
+        messages.push(current);
+        current = `${header[0]}（续）\n\n${block}`;
+      }
+    }
+    if (current) messages.push(current);
+    return messages;
+  }
+
+  async maybeCollectBinanceMajorNewsDaily(trigger = "timer") {
+    if (!this.config.binanceMajorNewsEnabled || this.binanceMajorNewsCollectionInFlight) return null;
+    const now = new Date();
+    const bj = getTimeParts(now, BJ_TIMEZONE);
+    const due =
+      bj.hour > this.binanceMajorNewsCollectionSchedule.hour ||
+      (bj.hour === this.binanceMajorNewsCollectionSchedule.hour && bj.minute >= this.binanceMajorNewsCollectionSchedule.minute);
+    if (!due) return null;
+
+    const dateKey = beijingDateKey(now);
+    const stored = this.db.getBinanceMajorNewsRun?.(dateKey);
+    if (stored?.finished_at && ["ok", "partial", "error"].includes(stored.status)) return stored;
+
+    this.binanceMajorNewsCollectionInFlight = true;
+    try {
+      this.db.startBinanceMajorNewsRun?.(dateKey);
+      let result;
+      try {
+        result = await this.binanceMajorNewsMonitor.run();
+      } catch (error) {
+        result = {
+          status: "error",
+          universeCount: 0,
+          items: [],
+          diagnostics: [],
+          error: String(error?.message || error)
+        };
+      }
+      this.db.finishBinanceMajorNewsRun?.(dateKey, result);
+      logger.info("binance_major_news_collection_done", {
+        trigger,
+        date: dateKey,
+        status: result.status,
+        universe: result.universeCount,
+        items: result.items.length
+      });
+      return this.db.getBinanceMajorNewsRun?.(dateKey) || null;
+    } finally {
+      this.binanceMajorNewsCollectionInFlight = false;
+    }
+  }
+
+  async maybeSendBinanceMajorNewsDailyReport(trigger = "timer") {
+    if (!this.config.binanceMajorNewsEnabled || this.binanceMajorNewsInFlight) return;
+    this.binanceMajorNewsInFlight = true;
+    try {
+      const now = new Date();
+      const bj = getTimeParts(now, BJ_TIMEZONE);
+      const due =
+        bj.hour > this.binanceMajorNewsSchedule.hour ||
+        (bj.hour === this.binanceMajorNewsSchedule.hour && bj.minute >= this.binanceMajorNewsSchedule.minute);
+      if (!due) return;
+
+      const dateKey = beijingDateKey(now);
+      const reportKey = `binance-major-news:${dateKey}`;
+      if (this.db.hasDailyReportSent?.(reportKey)) return;
+
+      let stored = this.db.getBinanceMajorNewsRun?.(dateKey);
+      if (!stored?.finished_at) stored = await this.maybeCollectBinanceMajorNewsDaily(trigger);
+      if (!stored?.finished_at) return;
+      const result = {
+        status: stored.status,
+        universeCount: stored.universe_count,
+        items: stored.findings,
+        diagnostics: stored.diagnostics,
+        error: stored.error
+      };
+      result.items = await this.binanceMajorNewsMarketMetrics.enrich(result.items);
+
+      const messages = this.buildBinanceMajorNewsMessages(dateKey, result);
+      for (const message of messages) {
+        const sendResult = await this.notifier.send({
+          message,
+          chatId: this.config.binanceMajorNewsDailyChatId || this.config.dailyReportChatId
+        });
+        if (!sendResult.ok) {
+          logger.warn("binance_major_news_report_send_failed", { trigger, dateKey, reason: sendResult.reason });
+          return;
+        }
+      }
+      this.db.saveDailyReport?.({
+        reportDate: reportKey,
+        timezone: BJ_TIMEZONE,
+        scheduledTime: this.binanceMajorNewsSchedule.text,
+        payload: { status: result.status, universe_count: result.universeCount, item_count: result.items.length }
+      });
+      logger.info("binance_major_news_report_sent", {
+        trigger,
+        date: dateKey,
+        status: result.status,
+        universe: result.universeCount,
+        items: result.items.length
+      });
+    } catch (error) {
+      logger.warn("binance_major_news_report_failed", { trigger, error: String(error?.message || error) });
+    } finally {
+      this.binanceMajorNewsInFlight = false;
+    }
+  }
+
   async maybeSendDailyReport(trigger = "timer") {
     if (!this.config.dailyReportEnabled || this.dailyReportInFlight) return;
     this.dailyReportInFlight = true;
@@ -240,7 +558,7 @@ export class EnginePipeline {
         };
       }
 
-      const sendResult = await this.notifier.send({ message });
+      const sendResult = await this.notifier.send({ message, chatId: this.config.dailyReportChatId });
 
       if (!sendResult.ok) {
         logger.warn("daily_report_send_failed", { trigger, dateKey, reason: sendResult.reason });
@@ -445,24 +763,45 @@ export class EnginePipeline {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    await this.runCycle();
+    const newsCycleEnabled = this.shouldRunNewsCycle();
+    if (newsCycleEnabled) {
+      await this.runCycle();
+    } else {
+      this.db.recordHealth("pipeline", "ok", "news_cycle_disabled");
+      logger.info("news_cycle_disabled");
+    }
+    await this.maybeCollectBinanceMajorNewsDaily("startup");
+    await this.maybeSendBinanceMajorNewsDailyReport("startup");
+    await this.maybeSendOpportunityDailyReport("startup");
     await this.maybeSendDailyReport("startup");
 
-    this.timer = setInterval(() => {
-      this.runCycle();
-    }, this.config.pollIntervalSec * 1000);
+    if (newsCycleEnabled) {
+      this.timer = setInterval(() => {
+        this.runCycle();
+      }, this.config.pollIntervalSec * 1000);
+    }
 
-    this.dailyReportTimer = setInterval(() => {
-      this.maybeSendDailyReport("timer");
+    this.dailyReportTimer = setInterval(async () => {
+      await this.maybeCollectBinanceMajorNewsDaily("timer");
+      await this.maybeSendBinanceMajorNewsDailyReport("timer");
+      await this.maybeSendOpportunityDailyReport("timer");
+      await this.maybeSendDailyReport("timer");
     }, Math.max(10, this.config.dailyReportCheckIntervalSec) * 1000);
 
-    this.opportunityMonitor.start();
+    if (this.config.opportunityScheduleMode === "interval") {
+      this.opportunityMonitor.start();
+    }
+    this.securityIncidentMonitor.start();
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
     if (this.dailyReportTimer) clearInterval(this.dailyReportTimer);
     this.opportunityMonitor.stop();
+    this.securityIncidentMonitor.stop();
+    this.binanceMajorNewsMarketMetrics.close().catch((error) => {
+      logger.warn("binance_major_news_market_metrics_close_failed", { error: String(error?.message || error) });
+    });
     this.isRunning = false;
   }
 }

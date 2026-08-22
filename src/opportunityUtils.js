@@ -17,6 +17,10 @@ const TYPE_ALIASES = new Map([
   ["pre-token", "pre_ipo"],
   ["pre_listing", "pre_ipo"],
   ["pre-listing", "pre_ipo"],
+  ["pre_tge", "pre_tge"],
+  ["pre-tge", "pre_tge"],
+  ["pretge", "pre_tge"],
+  ["pre_tge_event", "pre_tge"],
   ["short_term", "short_term"],
   ["short-term", "short_term"],
   ["temporary", "short_term"],
@@ -64,9 +68,52 @@ function parseNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function parseApyPercentFromText(value) {
-  const text = cleanText(value).replace(/,/g, "");
-  if (!text) return null;
+function hasNewUserTerm(text) {
+  return /new users?|new customer|first[-\s]?time|新户|新用户|新客|首次/i.test(String(text || ""));
+}
+
+function hasCurrentUserTerm(text) {
+  return /existing users?|existing|standard|regular|base|ordinary|all users?|current users?|老用户|现有用户|普通用户|标准|基础|基准|所有用户|全体用户|新老用户|老客|非新户/i.test(
+    String(text || "")
+  );
+}
+
+function hasNewUserOnlyTerm(text) {
+  return /new users? only|for new users?|new customer only|new user exclusive|新户限定|新户专属|新用户专享|新客专享|仅限新|只限新|首次专享/i.test(
+    String(text || "")
+  );
+}
+
+function isNewUserOnlySegment(text) {
+  const value = String(text || "");
+  return hasNewUserOnlyTerm(value) || (hasNewUserTerm(value) && !hasCurrentUserTerm(value) && /%|a\.?p\.?y\.?|a\.?p\.?r\.?|annual|年化|收益|利率|rate/i.test(value));
+}
+
+function splitApySegments(text) {
+  return String(text || "")
+    .split(/(?:\s+\/\s+)|[;；。,\n，]/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+function shouldSkipApyCandidate(text, match, parsed) {
+  const index = match.index || 0;
+  const matchText = match[0] || "";
+  const context = text.slice(Math.max(0, index - 28), Math.min(text.length, index + matchText.length + 28));
+  const after = text.slice(index + matchText.length, Math.min(text.length, index + matchText.length + 16));
+
+  if (
+    /(quota|allocation|cap|limit|limited|限额|额度|配额|每人|单用户|单人|per user)/i.test(context) &&
+    /(?:USDT|USDC|USD1|USD|U|美元|人|\/人|per user|each)/i.test(after)
+  ) {
+    return true;
+  }
+
+  if (!/%/.test(matchText) && parsed > 300) return true;
+  return false;
+}
+
+function collectApyCandidates(text) {
   const candidates = [];
 
   for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*%\s*(?:a\.?p\.?y\.?|a\.?p\.?r\.?|annual|年化)?/gi)) {
@@ -75,43 +122,89 @@ function parseApyPercentFromText(value) {
     const context = text.slice(contextStart, contextEnd);
     const linked = /a\.?p\.?y\.?|a\.?p\.?r\.?|annual|年化|收益|利率|rate|earn/i.test(context);
     const parsed = Number.parseFloat(match[1]);
-    if (Number.isFinite(parsed)) candidates.push({ value: parsed, linked });
+    if (Number.isFinite(parsed) && !shouldSkipApyCandidate(text, match, parsed)) {
+      candidates.push({ value: parsed, linked });
+    }
   }
 
-  for (const match of text.matchAll(/(?:a\.?p\.?y\.?|a\.?p\.?r\.?|annual|年化|收益|利率|rate)\D{0,24}(\d+(?:\.\d+)?)/gi)) {
+  for (const match of text.matchAll(/(?:a\.?p\.?y\.?|a\.?p\.?r\.?|annual|年化|收益|利率|rate)\D{0,12}(\d+(?:\.\d+)?)/gi)) {
     const parsed = Number.parseFloat(match[1]);
-    if (Number.isFinite(parsed)) candidates.push({ value: parsed, linked: true });
+    if (Number.isFinite(parsed) && !shouldSkipApyCandidate(text, match, parsed)) {
+      candidates.push({ value: parsed, linked: true });
+    }
   }
 
+  return candidates;
+}
+
+function selectApyCandidate(candidates, { allowUnlinked = false } = {}) {
   const linked = candidates.filter((candidate) => candidate.linked);
-  const pool = linked.length ? linked : candidates;
+  const pool = linked.length ? linked : allowUnlinked ? candidates : [];
   if (!pool.length) return null;
   return Math.max(...pool.map((candidate) => candidate.value));
 }
 
+function parseApyPercentFromText(value, { allowUnlinked = false, excludeNewUserOnly = true } = {}) {
+  const text = cleanText(value).replace(/(\d),(?=\d{3}\b)/g, "$1");
+  if (!text) return null;
+  const segments = splitApySegments(text);
+  const parsedSegments = (segments.length ? segments : [text]).map((segment) => ({
+    segment,
+    newUserOnly: isNewUserOnlySegment(segment),
+    candidates: collectApyCandidates(segment)
+  }));
+  const eligibleCandidates = parsedSegments
+    .filter((segment) => !(excludeNewUserOnly && segment.newUserOnly))
+    .flatMap((segment) => segment.candidates);
+  if (eligibleCandidates.length) return selectApyCandidate(eligibleCandidates, { allowUnlinked });
+
+  if (excludeNewUserOnly && parsedSegments.some((segment) => segment.newUserOnly && segment.candidates.length)) {
+    return null;
+  }
+
+  const candidates = parsedSegments.flatMap((segment) => segment.candidates);
+  return selectApyCandidate(candidates, { allowUnlinked });
+}
+
 export function parseApyPercent(raw = {}) {
+  const descriptiveText = [raw.expected_yield, raw.reward, raw.rewards, raw.incentive, raw.participation, raw.duration, raw.activity_name, raw.name]
+    .map(cleanText)
+    .join(" ");
+  const descriptiveValues = [raw.expected_yield, raw.reward, raw.rewards, raw.incentive, raw.participation, raw.duration]
+    .map(parseApyPercentFromText)
+    .filter(Number.isFinite);
+  if (hasNewUserTerm(descriptiveText)) {
+    if (descriptiveValues.length) return Math.max(...descriptiveValues);
+    if (splitApySegments(descriptiveText).some(isNewUserOnlySegment)) return null;
+  }
+
   const direct = [raw.apy, raw.apr, raw.expected_apy, raw.yield].map((value) => {
     if (typeof value === "number") return Number.isFinite(value) ? value : null;
-    return parseApyPercentFromText(value);
+    return parseApyPercentFromText(value, { allowUnlinked: true });
   });
   const directValues = direct.filter(Number.isFinite);
   if (directValues.length) return Math.max(...directValues);
 
-  const descriptiveValues = [raw.expected_yield, raw.reward, raw.rewards, raw.incentive, raw.participation, raw.duration]
-    .map(parseApyPercentFromText)
-    .filter(Number.isFinite);
   if (descriptiveValues.length) return Math.max(...descriptiveValues);
   return null;
 }
 
 export function parseMaxApyPercent(raw = {}) {
-  const direct = [raw.apy, raw.apr, raw.expected_apy, raw.yield].map((value) => {
-    if (typeof value === "number") return Number.isFinite(value) ? value : null;
-    return parseApyPercentFromText(value);
-  });
+  const descriptiveText = [raw.expected_yield, raw.reward, raw.rewards, raw.incentive, raw.participation, raw.duration, raw.activity_name, raw.name]
+    .map(cleanText)
+    .join(" ");
   const descriptiveValues = [raw.expected_yield, raw.reward, raw.rewards, raw.incentive, raw.participation, raw.duration]
     .map(parseApyPercentFromText)
     .filter(Number.isFinite);
+  if (hasNewUserTerm(descriptiveText)) {
+    if (descriptiveValues.length) return Math.max(...descriptiveValues);
+    if (splitApySegments(descriptiveText).some(isNewUserOnlySegment)) return null;
+  }
+
+  const direct = [raw.apy, raw.apr, raw.expected_apy, raw.yield].map((value) => {
+    if (typeof value === "number") return Number.isFinite(value) ? value : null;
+    return parseApyPercentFromText(value, { allowUnlinked: true });
+  });
   const values = direct.concat(descriptiveValues).filter(Number.isFinite);
   if (values.length) return Math.max(...values);
   return null;
@@ -284,7 +377,12 @@ export function normalizeOpportunity(raw, now = new Date(), options = {}) {
     Number.isFinite(sourcePublishedMs) &&
     Number.isFinite(nowMs) &&
     lookbackHours > 0 &&
-    nowMs - sourcePublishedMs > lookbackHours * 60 * 60 * 1000
+    nowMs - sourcePublishedMs > lookbackHours * 60 * 60 * 1000 &&
+    !(
+      (type === "launch" || type === "pre_tge") &&
+      Number.isFinite(deadlineMs) &&
+      deadlineMs >= nowMs
+    )
   ) {
     return null;
   }
@@ -293,7 +391,7 @@ export function normalizeOpportunity(raw, now = new Date(), options = {}) {
   let status = expired ? "expired" : "active";
   if (!sourceUrl || !sourceUser || credibility === "unverified") status = expired ? "expired" : "unverified";
   if (!sourcePublishedAt) status = expired ? "expired" : "unverified";
-  if ((isStablecoinEarn || type === "launch" || type === "pre_ipo") && !deadlineAt) {
+  if ((isStablecoinEarn || type === "launch" || type === "pre_ipo" || type === "pre_tge") && !deadlineAt) {
     status = expired ? "expired" : "unverified";
   }
 
@@ -386,7 +484,12 @@ function classifyNormalizeDrop(raw, now = new Date(), options = {}) {
     Number.isFinite(sourcePublishedMs) &&
     Number.isFinite(nowMs) &&
     lookbackHours > 0 &&
-    nowMs - sourcePublishedMs > lookbackHours * 60 * 60 * 1000
+    nowMs - sourcePublishedMs > lookbackHours * 60 * 60 * 1000 &&
+    !(
+      (type === "launch" || type === "pre_tge") &&
+      Number.isFinite(deadlineMs) &&
+      deadlineMs >= nowMs
+    )
   ) {
     return "outside_lookback";
   }

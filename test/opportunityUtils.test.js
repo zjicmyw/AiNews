@@ -119,7 +119,7 @@ test("normalizeOpportunity keeps stablecoin APY above the threshold", () => {
   assert.equal(item.status, "active");
 });
 
-test("normalizeOpportunity parses APY strings without treating duration as yield", () => {
+test("normalizeOpportunity prefers existing-user APY over new-user APY", () => {
   const item = normalizeOpportunity(
     baseOpportunity({
       apy: "7-day new users up to 100% APR / 30-day existing users up to 16% APR",
@@ -128,7 +128,20 @@ test("normalizeOpportunity parses APY strings without treating duration as yield
     NOW
   );
 
-  assert.equal(item.apy, 100);
+  assert.equal(item.apy, 16);
+  assert.equal(item.status, "active");
+});
+
+test("normalizeOpportunity prefers textual existing-user APY over numeric new-user APY", () => {
+  const item = normalizeOpportunity(
+    baseOpportunity({
+      apy: 100,
+      duration: "7-day new users up to 100% APR / 30-day existing users up to 16% APR"
+    }),
+    NOW
+  );
+
+  assert.equal(item.apy, 16);
   assert.equal(item.status, "active");
 });
 
@@ -143,6 +156,20 @@ test("normalizeOpportunity parses APY strings without treating quota as yield", 
 
   assert.equal(item.apy, 10.5);
   assert.equal(item.status, "active");
+});
+
+test("normalizeOpportunity drops stablecoin earn rows that only expose new-user APY", () => {
+  const item = normalizeOpportunity(
+    baseOpportunity({
+      apy: "new users up to 100% APR",
+      expected_yield: "New users only promotional APR",
+      reward: "",
+      duration: "7 days"
+    }),
+    NOW
+  );
+
+  assert.equal(item, null);
 });
 
 test("normalizeOpportunity can recover APY from yield detail fields", () => {
@@ -162,7 +189,7 @@ test("normalizeOpportunity can recover APY from yield detail fields", () => {
   assert.equal(item.status, "active");
 });
 
-test("parseMaxApyPercent takes higher promotional APY from descriptive fields", () => {
+test("parseMaxApyPercent uses current-user APY from descriptive fields", () => {
   const apy = parseMaxApyPercent(
     baseOpportunity({
       apy: 16,
@@ -170,7 +197,36 @@ test("parseMaxApyPercent takes higher promotional APY from descriptive fields", 
     })
   );
 
-  assert.equal(apy, 100);
+  assert.equal(apy, 16);
+});
+
+test("parseMaxApyPercent keeps comma-separated new-user percentages out of current APY", () => {
+  const apy = parseMaxApyPercent({
+    apy: 16,
+    expected_yield: "Up to 16% APR (existing), 100% new users",
+    duration: "7-day (new users up to 100% APR) / 30-day (existing up to 16% APR)"
+  });
+
+  assert.equal(apy, 16);
+});
+
+test("parseMaxApyPercent does not treat stablecoin quota as APY", () => {
+  const apy = parseMaxApyPercent({
+    expected_yield: "最高10.5% APR（含阶梯 bonus），普通用户限额2000 USD1/人，基础 APR 5.2%-6.24%",
+    reward: "实时 APR 奖励 + 额外阶梯 bonus"
+  });
+
+  assert.equal(apy, 10.5);
+});
+
+test("parseMaxApyPercent does not treat subsidy percentages as APY", () => {
+  const apy = parseMaxApyPercent({
+    apy: 12,
+    expected_yield: "最高 12% APR（USDT/USDC 1:1 转换 USDGO）",
+    participation: "Convert USDT/USDC to USDGO with 100% subsidy then subscribe to Earn product"
+  });
+
+  assert.equal(apy, 12);
 });
 
 test("normalizeOpportunity preserves official deadline metadata", () => {
@@ -228,6 +284,31 @@ test("normalizeOpportunity keeps stablecoin-funded Pre-IPO without requiring APY
   assert.equal(item.status, "active");
 });
 
+test("normalizeOpportunity supports Pre-TGE opportunities", () => {
+  const now = new Date("2026-08-09T04:00:00.000Z");
+  const item = normalizeOpportunity(
+    {
+      activity_name: "Example Pre-TGE points snapshot",
+      type: "Pre-TGE",
+      section: "onchain",
+      venue: "Example Protocol",
+      asset: "EXAMPLE",
+      reward: "TGE allocation",
+      deadline_at: "2026-08-10T00:00:00.000Z",
+      source_published_at: "2026-08-09T02:00:00.000Z",
+      participation: "Complete official points task",
+      source_user: "@example",
+      source_url: "https://x.com/example/status/123",
+      credibility: "official"
+    },
+    now,
+    { lookbackHours: 24 }
+  );
+
+  assert.equal(item.type, "pre_tge");
+  assert.equal(item.status, "active");
+});
+
 test("normalizeOpportunity keeps onchain stablecoin opportunities in the onchain category", () => {
   const item = normalizeOpportunity(
     {
@@ -271,6 +352,29 @@ test("normalizeOpportunity drops posts outside configured lookback", () => {
   );
 
   assert.equal(item, null);
+});
+
+test("normalizeOpportunity keeps an older launch announcement while its deadline is still future", () => {
+  const item = normalizeOpportunity(
+    baseOpportunity({
+      activity_name: "Multipli MULT community sale",
+      type: "launch",
+      section: "onchain",
+      exchange: "",
+      venue: "Sonar / Echo",
+      asset: "MULT",
+      stablecoin: "USDC",
+      apy: null,
+      source_published_at: "2026-06-05T00:00:00.000Z",
+      deadline_at: "2026-06-12T00:00:00.000Z"
+    }),
+    NOW,
+    { lookbackHours: 72 }
+  );
+
+  assert.equal(item.type, "launch");
+  assert.equal(item.section, "onchain");
+  assert.equal(item.asset, "MULT");
 });
 
 test("DbClient filters expired opportunities out of active results", (t) => {
@@ -340,6 +444,66 @@ test("DbClient display results include unverified but still filter expired rows"
         ["Binance USDC Earn Boost", "active"],
         ["Gate SpaceX Pre-IPO 机会", "unverified"]
       ]
+    );
+  });
+});
+
+test("DbClient keeps stale opportunities with future deadlines visible", (t) => {
+  withTempDb(t, (db) => {
+    const item = normalizeOpportunity(
+      baseOpportunity({
+        activity_name: "Long Running Future Campaign",
+        source_url: "https://x.com/binance/status/24",
+        deadline_at: "2026-07-01T00:00:00.000Z"
+      }),
+      NOW
+    );
+
+    db.upsertOpportunity(item);
+    db.db
+      .prepare("UPDATE opportunities SET last_seen_at = ?, updated_at = ? WHERE dedup_key = ?")
+      .run("2026-06-01T00:00:00.000Z", "2026-06-01T00:00:00.000Z", item.dedup_key);
+
+    const rows = db.getDisplayOpportunities(96, NOW.toISOString());
+    assert.deepEqual(
+      rows.map((row) => row.activity_name),
+      ["Long Running Future Campaign"]
+    );
+  });
+});
+
+test("DbClient applies the stale window only when deadline is unknown", (t) => {
+  withTempDb(t, (db) => {
+    const recentUnknownDeadline = normalizeOpportunity(
+      baseOpportunity({
+        activity_name: "Recent No Fixed Deadline",
+        source_url: "https://x.com/binance/status/25",
+        deadline_at: null
+      }),
+      NOW
+    );
+    const oldUnknownDeadline = normalizeOpportunity(
+      baseOpportunity({
+        activity_name: "Old No Fixed Deadline",
+        source_url: "https://x.com/binance/status/26",
+        deadline_at: null
+      }),
+      NOW
+    );
+
+    db.upsertOpportunity(recentUnknownDeadline);
+    db.upsertOpportunity(oldUnknownDeadline);
+    db.db
+      .prepare("UPDATE opportunities SET last_seen_at = ?, updated_at = ? WHERE dedup_key = ?")
+      .run("2026-04-20T00:00:00.000Z", "2026-04-20T00:00:00.000Z", recentUnknownDeadline.dedup_key);
+    db.db
+      .prepare("UPDATE opportunities SET last_seen_at = ?, updated_at = ? WHERE dedup_key = ?")
+      .run("2026-03-01T00:00:00.000Z", "2026-03-01T00:00:00.000Z", oldUnknownDeadline.dedup_key);
+
+    const rows = db.getDisplayOpportunities(1440, NOW.toISOString());
+    assert.deepEqual(
+      rows.map((row) => row.activity_name),
+      ["Recent No Fixed Deadline"]
     );
   });
 });
@@ -506,6 +670,63 @@ test("DbClient persists opportunity run job stats", (t) => {
   });
 });
 
+test("DbClient tracks daily opportunity runs and filters report rows by type", (t) => {
+  withTempDb(t, (db) => {
+    const windowStart = new Date(Date.now() - 60_000).toISOString();
+    const runId = db.startOpportunityRun({ startedAt: new Date().toISOString(), prompt: "daily test" });
+    db.finishOpportunityRun(runId, {
+      status: "ok",
+      durationMs: 1,
+      rawResponse: "{}",
+      error: "",
+      itemCount: 1,
+      jobStats: []
+    });
+    const preTge = normalizeOpportunity(
+      baseOpportunity({
+        activity_name: "Example Pre-TGE",
+        type: "pre_tge",
+        section: "onchain",
+        exchange: "",
+        venue: "Example Protocol",
+        stablecoin: "",
+        apy: null,
+        source_url: "https://x.com/example/status/pre-tge"
+      }),
+      NOW
+    );
+    const stablecoin = normalizeOpportunity(
+      baseOpportunity({ source_url: "https://x.com/binance/status/stablecoin" }),
+      NOW
+    );
+    db.upsertOpportunity(preTge);
+    db.upsertOpportunity(stablecoin);
+
+    const windowEnd = new Date(Date.now() + 60_000).toISOString();
+    assert.equal(db.hasOpportunityRunSince(windowStart, windowEnd), true);
+    const rows = db.getOpportunitiesSeenSince(windowStart, windowEnd, ["launch", "pre_tge"], 8);
+    assert.deepEqual(rows.map((row) => row.type), ["pre_tge"]);
+  });
+});
+
+test("DbClient does not treat a failed opportunity run as daily collection", (t) => {
+  withTempDb(t, (db) => {
+    const windowStart = new Date(Date.now() - 60_000).toISOString();
+    const runId = db.startOpportunityRun({ startedAt: new Date().toISOString(), prompt: "failed daily test" });
+    db.finishOpportunityRun(runId, {
+      status: "error",
+      durationMs: 1,
+      rawResponse: "",
+      error: "hermes_failed:ENOENT",
+      itemCount: 0,
+      jobStats: []
+    });
+    const windowEnd = new Date(Date.now() + 60_000).toISOString();
+
+    assert.equal(db.hasOpportunityRunSince(windowStart, windowEnd), false);
+  });
+});
+
 test("normalizeOpportunityBatch deduplicates repeated source links", () => {
   const rows = normalizeOpportunityBatch([baseOpportunity(), baseOpportunity({ apy: 14 })], NOW);
 
@@ -538,7 +759,7 @@ test("normalizeOpportunityBatchWithReport explains filtered candidates", () => {
   assert.equal(report.by_job.cex_launch.drop_reasons.length, 2);
 });
 
-test("normalizeOpportunityBatchWithReport keeps promotional APY strings above threshold", () => {
+test("normalizeOpportunityBatchWithReport keeps current-user APY from promotional strings", () => {
   const { items, report } = normalizeOpportunityBatchWithReport(
     [
       baseOpportunity({
@@ -551,6 +772,6 @@ test("normalizeOpportunityBatchWithReport keeps promotional APY strings above th
   );
 
   assert.equal(items.length, 1);
-  assert.equal(items[0].apy, 100);
+  assert.equal(items[0].apy, 16);
   assert.equal(report.dropped_count, 0);
 });

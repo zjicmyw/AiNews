@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { OpportunityMonitor } from "../src/opportunityMonitor.js";
 
@@ -45,6 +48,111 @@ test("OpportunityMonitor records raw output when xintel JSON parsing fails", asy
   assert.equal(finish.row.jobStats[0].candidate_count, 0);
 });
 
+test("OpportunityMonitor backs off repeated empty xintel responses", async () => {
+  const db = createDbStub();
+  const monitor = new OpportunityMonitor({
+    config: {
+      opportunityMonitorEnabled: true,
+      opportunityLookbackHours: 72,
+      opportunityMaxFollowups: 0,
+      opportunityFocusedQueriesEnabled: false,
+      opportunityQueryMatrixEnabled: false,
+      opportunityEmptyResponseBackoffSec: 3600
+    },
+    db
+  });
+  monitor.callHermes = async () => "";
+
+  const first = await monitor.runOnce("test");
+  const callCountAfterFirst = db.calls.length;
+  const second = await monitor.runOnce("test");
+
+  assert.equal(first.ok, false);
+  assert.equal(db.calls.find((call) => call.name === "finish").row.error, "main:xintel_parse_failed:empty_response");
+  assert.equal(Boolean(monitor.getStatus().paused_until), true);
+  assert.equal(second.skipped, true);
+  assert.equal(second.reason, "xintel_empty_response_backoff");
+  assert.equal(db.calls.length, callCountAfterFirst);
+});
+
+test("OpportunityMonitor records a valid empty candidate response as success", async () => {
+  const db = createDbStub();
+  const monitor = new OpportunityMonitor({
+    config: {
+      opportunityMonitorEnabled: true,
+      opportunityLookbackHours: 24,
+      opportunityMaxFollowups: 0,
+      opportunityFocusedQueriesEnabled: false,
+      opportunityQueryMatrixEnabled: false,
+      opportunityEnrichmentEnabled: false
+    },
+    db
+  });
+  monitor.callHermes = async () => '{"opportunities":[]}';
+
+  const result = await monitor.runOnce("test");
+  const finish = db.calls.find((call) => call.name === "finish");
+
+  assert.deepEqual(result, {
+    ok: true,
+    partial: false,
+    items: 0,
+    existing_enriched: 0,
+    errors: []
+  });
+  assert.equal(finish.runId, 42);
+  assert.equal(finish.row.status, "ok");
+  assert.equal(finish.row.error, "");
+  assert.equal(finish.row.itemCount, 0);
+  assert.equal(finish.row.jobStats.length, 1);
+  assert.equal(finish.row.jobStats[0].status, "ok");
+  assert.equal(finish.row.jobStats[0].candidate_count, 0);
+});
+
+test("OpportunityMonitor backs off quota errors and stops remaining query jobs", async () => {
+  const db = createDbStub();
+  const monitor = new OpportunityMonitor({
+    config: {
+      opportunityMonitorEnabled: true,
+      opportunityLookbackHours: 72,
+      opportunityMaxFollowups: 0,
+      opportunityFocusedQueriesEnabled: false,
+      opportunityQueryMatrixEnabled: true,
+      opportunityMaxQueryJobs: 2,
+      opportunityQuotaErrorBackoffSec: 43200
+    },
+    db
+  });
+  let callCount = 0;
+  monitor.callHermes = async () => {
+    callCount += 1;
+    throw new Error(
+      "hermes_failed:1:Error: Error code: 403 - {'code': 'personal-team-blocked:spending-limit', 'error': 'You have run out of credits or need a Grok subscription.'}"
+    );
+  };
+
+  const first = await monitor.runOnce("test");
+  const finish = db.calls.find((call) => call.name === "finish");
+  const callCountAfterFirst = callCount;
+  const status = monitor.getStatus();
+  const pausedMs = Date.parse(status.paused_until) - Date.now();
+  const second = await monitor.runOnce("test");
+
+  assert.equal(first.ok, false);
+  assert.equal(callCountAfterFirst, 1);
+  assert.equal(finish.row.status, "error");
+  assert.equal(finish.row.jobStats.length, 1);
+  assert.equal(finish.row.jobStats[0].name, "main");
+  assert.match(finish.row.error, /spending-limit/);
+  assert.equal(Boolean(status.paused_until), true);
+  assert.equal(status.next_run_at, status.paused_until);
+  assert.ok(pausedMs > 43100 * 1000);
+  assert.ok(pausedMs <= 43200 * 1000 + 5000);
+  assert.equal(second.skipped, true);
+  assert.equal(second.reason, "xintel_quota_error_backoff");
+  assert.equal(callCount, callCountAfterFirst);
+});
+
 test("OpportunityMonitor records partial Hermes output when the command fails", async () => {
   const db = createDbStub();
   const monitor = new OpportunityMonitor({
@@ -75,6 +183,80 @@ test("OpportunityMonitor records partial Hermes output when the command fails", 
   assert.equal(finish.row.jobStats[0].error, "hermes_timeout_after_120000ms");
 });
 
+test("OpportunityMonitor.callHermes uses Hermes chat query mode", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ainews-hermes-"));
+  const argsPath = path.join(dir, "args.txt");
+  const binPath = path.join(dir, "hermes");
+  fs.writeFileSync(
+    binPath,
+    `#!/bin/sh
+printf '%s\\n' "$@" > '${argsPath}'
+printf '{"opportunities":[]}'
+`,
+    { mode: 0o755 }
+  );
+
+  try {
+    const monitor = new OpportunityMonitor({
+      config: {
+        opportunityHermesBin: binPath,
+        opportunityHermesProfile: "xintel",
+        opportunityHermesTimeoutSec: 10
+      },
+      db: createDbStub()
+    });
+
+    const raw = await monitor.callHermes("hello query");
+    const args = fs.readFileSync(argsPath, "utf8").trim().split("\n");
+
+    assert.equal(raw, '{"opportunities":[]}');
+    assert.deepEqual(args, [
+      "--profile",
+      "xintel",
+      "chat",
+      "--query",
+      "hello query",
+      "--quiet",
+      "--ignore-rules",
+      "--source",
+      "tool"
+    ]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("OpportunityMonitor.callHermes preserves Hermes stderr failures", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ainews-hermes-error-"));
+  const binPath = path.join(dir, "hermes");
+  fs.writeFileSync(
+    binPath,
+    `#!/bin/sh
+printf 'Error code: 403 - spending limit reached\\n' >&2
+exit 1
+`,
+    { mode: 0o755 }
+  );
+
+  try {
+    const monitor = new OpportunityMonitor({
+      config: {
+        opportunityHermesBin: binPath,
+        opportunityHermesProfile: "xintel",
+        opportunityHermesTimeoutSec: 10
+      },
+      db: createDbStub()
+    });
+
+    await assert.rejects(
+      () => monitor.callHermes("hello query"),
+      /hermes_failed:1:Error code: 403 - spending limit reached/
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("OpportunityMonitor prevents overlapping runs", async () => {
   const db = createDbStub();
   const monitor = new OpportunityMonitor({
@@ -101,7 +283,8 @@ test("OpportunityMonitor accumulates focused Gate and onchain query results", as
       opportunityMonitorEnabled: true,
       opportunityLookbackHours: 72,
       opportunityMaxFollowups: 0,
-      opportunityFocusedQueriesEnabled: true
+      opportunityFocusedQueriesEnabled: true,
+      opportunityMaxQueryJobs: 3
     },
     db
   });
@@ -365,8 +548,8 @@ test("OpportunityMonitor inserts coverage gap search job from current opportunit
   assert.equal(upserts.length, 4);
   assert.match(start.prompt, /## cex_coverage_gaps/);
   assert.match(start.prompt, /当前网页覆盖矩阵的空白缺口/);
-  assert.match(start.prompt, /OKX \/ 稳定币理财/);
-  assert.match(start.prompt, /Pre-IPO\/Pre-token\/Pre-listing 必须写清是否可用稳定币参与/);
+  assert.match(start.prompt, /OKX \/ Pre-TGE/);
+  assert.match(start.prompt, /Pre-TGE token generation whitelist/);
 });
 
 test("OpportunityMonitor exposes next query plan with coverage gaps", () => {
@@ -403,8 +586,67 @@ test("OpportunityMonitor exposes next query plan with coverage gaps", () => {
   assert.equal(plan.jobs[0].name, "main");
   assert.equal(plan.jobs[2].name, "cex_coverage_gaps");
   assert.equal(plan.jobs[2].type, "coverage_gap");
-  assert.equal(plan.jobs[2].gaps[0].exchange, "OKX");
-  assert.equal(plan.jobs[2].gaps[0].label, "稳定币理财");
+  assert.equal(plan.jobs[2].gaps[0].exchange, "Binance");
+  assert.equal(plan.jobs[2].gaps[0].label, "Pre-TGE");
+});
+
+test("OpportunityMonitor daily plan only collects launch and Pre-TGE", () => {
+  const monitor = new OpportunityMonitor({
+    config: {
+      opportunityMonitorEnabled: true,
+      opportunityIntervalSec: 86400,
+      opportunityLookbackHours: 24,
+      opportunityCollectionTypes: ["launch", "pre_tge"],
+      opportunityMaxQueryJobs: 3
+    },
+    db: createDbStub()
+  });
+
+  const plan = monitor.getQueryPlan();
+
+  assert.equal(plan.interval_sec, 86400);
+  assert.equal(plan.lookback_hours, 24);
+  assert.deepEqual(plan.jobs.map((job) => job.name), ["cex_launch", "onchain_launch", "pre_tge"]);
+  assert.match(plan.jobs[1].label, /链上打新/);
+});
+
+test("OpportunityMonitor saver plan keeps main plus one rotating matrix job", () => {
+  const db = createDbStub();
+  db.getLatestOpportunityRun = () => ({ id: 0 });
+  db.getDisplayOpportunities = () => [
+    {
+      activity_name: "Existing Binance USD1 Earn",
+      type: "stablecoin_earn",
+      section: "cex",
+      exchange: "Binance",
+      stablecoin: "USD1",
+      apy: 10,
+      status: "active"
+    }
+  ];
+  const monitor = new OpportunityMonitor({
+    config: {
+      opportunityMonitorEnabled: true,
+      opportunityIntervalSec: 21600,
+      opportunityLookbackHours: 72,
+      opportunityFocusedQueriesEnabled: false,
+      opportunityQueryMatrixEnabled: true,
+      opportunityMaxQueryJobs: 2,
+      opportunityStaleAfterHours: 1440
+    },
+    db
+  });
+
+  const plan = monitor.getQueryPlan();
+
+  assert.equal(plan.enabled, true);
+  assert.equal(plan.interval_sec, 21600);
+  assert.equal(plan.max_jobs, 2);
+  assert.equal(plan.job_count, 2);
+  assert.equal(plan.jobs[0].name, "main");
+  assert.equal(plan.jobs[1].name, "cex_pre_ipo");
+  assert.equal(plan.jobs.some((job) => job.name === "gate_spacex"), false);
+  assert.equal(plan.jobs.some((job) => job.name === "cex_coverage_gaps"), false);
 });
 
 test("OpportunityMonitor adapts query plan after main query timeout", () => {

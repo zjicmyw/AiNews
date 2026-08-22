@@ -124,6 +124,17 @@ export class DbClient {
         item_count INTEGER DEFAULT 0
       );
 
+      CREATE TABLE IF NOT EXISTS binance_major_news_runs (
+        report_date TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        status TEXT NOT NULL,
+        universe_count INTEGER DEFAULT 0,
+        findings_json TEXT,
+        diagnostics_json TEXT,
+        error TEXT
+      );
+
       CREATE TABLE IF NOT EXISTS opportunities (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         dedup_key TEXT NOT NULL UNIQUE,
@@ -152,14 +163,41 @@ export class DbClient {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS security_incidents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dedup_key TEXT NOT NULL UNIQUE,
+        project TEXT NOT NULL,
+        incident_type TEXT NOT NULL,
+        amount_usd REAL,
+        chain_platform TEXT,
+        source_url TEXT,
+        source_user TEXT,
+        source_type TEXT,
+        source_published_at TEXT,
+        confidence TEXT,
+        evidence_score REAL,
+        evidence_level TEXT,
+        summary TEXT,
+        alert_level TEXT NOT NULL,
+        anomaly_pushed_at TEXT,
+        critical_pushed_at TEXT,
+        raw_json TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_events_ingest_time ON events(ingest_time);
       CREATE INDEX IF NOT EXISTS idx_push_logs_pushed_at ON push_logs(pushed_at);
       CREATE INDEX IF NOT EXISTS idx_push_logs_dedup_key ON push_logs(dedup_key);
       CREATE INDEX IF NOT EXISTS idx_x_user_cache_updated_at ON x_user_cache(updated_at);
       CREATE INDEX IF NOT EXISTS idx_x_since_cache_updated_at ON x_since_cache(updated_at);
       CREATE INDEX IF NOT EXISTS idx_opportunity_runs_started_at ON opportunity_runs(started_at);
+      CREATE INDEX IF NOT EXISTS idx_binance_major_news_runs_finished_at ON binance_major_news_runs(finished_at);
       CREATE INDEX IF NOT EXISTS idx_opportunities_status_last_seen ON opportunities(status, last_seen_at);
       CREATE INDEX IF NOT EXISTS idx_opportunities_section_type ON opportunities(section, type);
+      CREATE INDEX IF NOT EXISTS idx_security_incidents_last_seen ON security_incidents(last_seen_at);
+      CREATE INDEX IF NOT EXISTS idx_security_incidents_alert_level ON security_incidents(alert_level);
     `);
 
     ensureColumn(this.db, "opportunities", "official_url", "TEXT");
@@ -170,6 +208,12 @@ export class DbClient {
     ensureColumn(this.db, "opportunities", "enriched_at", "TEXT");
     ensureColumn(this.db, "opportunities", "enrichment_error", "TEXT");
     ensureColumn(this.db, "opportunity_runs", "job_stats", "TEXT");
+    ensureColumn(this.db, "security_incidents", "anomaly_pushed_at", "TEXT");
+    ensureColumn(this.db, "security_incidents", "critical_pushed_at", "TEXT");
+    ensureColumn(this.db, "security_incidents", "source_user", "TEXT");
+    ensureColumn(this.db, "security_incidents", "source_type", "TEXT");
+    ensureColumn(this.db, "security_incidents", "evidence_score", "REAL");
+    ensureColumn(this.db, "security_incidents", "evidence_level", "TEXT");
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_opportunities_deadline_source ON opportunities(deadline_source);
@@ -425,6 +469,18 @@ export class DbClient {
       .run(new Date().toISOString(), module, status, detail);
   }
 
+  getRecentHealth(module, limit = 10) {
+    return this.db
+      .prepare(
+        `SELECT ts, module, status, detail
+         FROM system_health
+         WHERE module = ?
+         ORDER BY id DESC
+         LIMIT ?`
+      )
+      .all(module, Math.max(1, Math.min(50, Number(limit || 10))));
+  }
+
   getStats() {
     const events = this.db.prepare(`SELECT COUNT(*) AS cnt FROM events`).get();
     const pushes = this.db.prepare(`SELECT COUNT(*) AS cnt FROM push_logs WHERE push_flag = 1`).get();
@@ -605,21 +661,156 @@ export class DbClient {
       .run(nowIso, nowIso);
   }
 
-  getActiveOpportunities(staleAfterHours = 96, nowIso = new Date().toISOString()) {
+  getSecurityIncidentByDedup(dedupKey) {
+    return this.db.prepare(`SELECT * FROM security_incidents WHERE dedup_key = ?`).get(dedupKey);
+  }
+
+  upsertSecurityIncident(item) {
+    const nowIso = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO security_incidents (
+          dedup_key, project, incident_type, amount_usd, chain_platform, source_url, source_user,
+          source_type, source_published_at, confidence, evidence_score, evidence_level, summary, alert_level, anomaly_pushed_at,
+          critical_pushed_at, raw_json, first_seen_at, last_seen_at, updated_at
+        ) VALUES (
+          @dedup_key, @project, @incident_type, @amount_usd, @chain_platform, @source_url, @source_user,
+          @source_type, @source_published_at, @confidence, @evidence_score, @evidence_level, @summary, @alert_level, @anomaly_pushed_at,
+          @critical_pushed_at, @raw_json, @first_seen_at, @last_seen_at, @updated_at
+        )
+        ON CONFLICT(dedup_key) DO UPDATE SET
+          project=excluded.project,
+          incident_type=excluded.incident_type,
+          amount_usd=CASE
+            WHEN excluded.amount_usd IS NULL THEN security_incidents.amount_usd
+            WHEN security_incidents.amount_usd IS NULL THEN excluded.amount_usd
+            WHEN excluded.amount_usd > security_incidents.amount_usd THEN excluded.amount_usd
+            ELSE security_incidents.amount_usd
+          END,
+          chain_platform=COALESCE(excluded.chain_platform, security_incidents.chain_platform),
+          source_url=COALESCE(excluded.source_url, security_incidents.source_url),
+          source_user=COALESCE(excluded.source_user, security_incidents.source_user),
+          source_type=CASE
+            WHEN security_incidents.source_type IN ('official', 'security_researcher') THEN security_incidents.source_type
+            WHEN excluded.source_type IN ('official', 'security_researcher') THEN excluded.source_type
+            WHEN security_incidents.source_type = 'media' THEN security_incidents.source_type
+            WHEN excluded.source_type = 'media' THEN excluded.source_type
+            WHEN security_incidents.source_type = 'kol' THEN security_incidents.source_type
+            WHEN excluded.source_type = 'kol' THEN excluded.source_type
+            ELSE COALESCE(excluded.source_type, security_incidents.source_type)
+          END,
+          source_published_at=COALESCE(excluded.source_published_at, security_incidents.source_published_at),
+          confidence=excluded.confidence,
+          evidence_score=CASE
+            WHEN excluded.evidence_score IS NULL THEN security_incidents.evidence_score
+            WHEN security_incidents.evidence_score IS NULL THEN excluded.evidence_score
+            WHEN excluded.evidence_score > security_incidents.evidence_score THEN excluded.evidence_score
+            ELSE security_incidents.evidence_score
+          END,
+          evidence_level=CASE
+            WHEN excluded.evidence_level = 'high' OR security_incidents.evidence_level = 'high' THEN 'high'
+            WHEN excluded.evidence_level = 'medium' OR security_incidents.evidence_level = 'medium' THEN 'medium'
+            ELSE COALESCE(excluded.evidence_level, security_incidents.evidence_level)
+          END,
+          summary=excluded.summary,
+          alert_level=CASE
+            WHEN excluded.alert_level = 'critical' OR security_incidents.alert_level = 'critical' THEN 'critical'
+            WHEN excluded.alert_level = 'anomaly' OR security_incidents.alert_level = 'anomaly' THEN 'anomaly'
+            ELSE COALESCE(excluded.alert_level, security_incidents.alert_level)
+          END,
+          raw_json=excluded.raw_json,
+          last_seen_at=excluded.last_seen_at,
+          updated_at=excluded.updated_at`
+      )
+      .run({
+        dedup_key: item.dedup_key,
+        project: item.project,
+        incident_type: item.incident_type,
+        amount_usd: Number.isFinite(item.amount_usd) ? item.amount_usd : null,
+        chain_platform: item.chain_platform || null,
+        source_url: item.source_url || null,
+        source_user: item.source_user || null,
+        source_type: item.source_type || "unknown",
+        source_published_at: item.source_published_at || null,
+        confidence: item.confidence || "medium",
+        evidence_score: Number.isFinite(item.evidence_score) ? item.evidence_score : null,
+        evidence_level: item.evidence_level || null,
+        summary: item.summary || "",
+        alert_level: item.alert_level || "anomaly",
+        anomaly_pushed_at: item.anomaly_pushed_at || null,
+        critical_pushed_at: item.critical_pushed_at || null,
+        raw_json: item.raw_json || JSON.stringify(item),
+        first_seen_at: item.first_seen_at || nowIso,
+        last_seen_at: nowIso,
+        updated_at: nowIso
+      });
+    return this.getSecurityIncidentByDedup(item.dedup_key);
+  }
+
+  markSecurityIncidentPushed(dedupKey, alertLevel, pushedAt = new Date().toISOString()) {
+    const column = alertLevel === "critical" ? "critical_pushed_at" : "anomaly_pushed_at";
+    this.db.prepare(`UPDATE security_incidents SET ${column} = ?, updated_at = ? WHERE dedup_key = ?`).run(
+      pushedAt,
+      pushedAt,
+      dedupKey
+    );
+  }
+
+  getSecurityIncidents(limit = 20) {
+    return this.db
+      .prepare(
+        `SELECT *
+         FROM security_incidents
+         ORDER BY updated_at DESC, id DESC
+         LIMIT ?`
+      )
+      .all(Math.max(1, Math.min(100, Number(limit || 20))))
+      .map((row) => ({
+        ...row,
+        amount_usd: row.amount_usd === null || row.amount_usd === undefined ? null : Number(row.amount_usd),
+        evidence_score: row.evidence_score === null || row.evidence_score === undefined ? null : Number(row.evidence_score)
+      }));
+  }
+
+  getSecurityIncidentSummary() {
+    const total = this.db.prepare(`SELECT COUNT(*) AS cnt FROM security_incidents`).get();
+    const critical = this.db.prepare(`SELECT COUNT(*) AS cnt FROM security_incidents WHERE alert_level = 'critical'`).get();
+    const anomaly = this.db.prepare(`SELECT COUNT(*) AS cnt FROM security_incidents WHERE alert_level = 'anomaly'`).get();
+    const watch = this.db.prepare(`SELECT COUNT(*) AS cnt FROM security_incidents WHERE alert_level = 'watch'`).get();
+    const pushed = this.db
+      .prepare(
+        `SELECT COUNT(*) AS cnt
+         FROM security_incidents
+         WHERE anomaly_pushed_at IS NOT NULL OR critical_pushed_at IS NOT NULL`
+      )
+      .get();
+    return {
+      total: Number(total?.cnt || 0),
+      critical: Number(critical?.cnt || 0),
+      anomaly: Number(anomaly?.cnt || 0),
+      watch: Number(watch?.cnt || 0),
+      pushed: Number(pushed?.cnt || 0)
+    };
+  }
+
+  getActiveOpportunities(staleAfterHours = 1440, nowIso = new Date().toISOString()) {
     return this.getDisplayOpportunities(staleAfterHours, nowIso).filter((row) => row.status === "active");
   }
 
-  getDisplayOpportunities(staleAfterHours = 96, nowIso = new Date().toISOString()) {
-    const staleHours = Math.max(1, Number(staleAfterHours || 96));
+  getDisplayOpportunities(staleAfterHours = 1440, nowIso = new Date().toISOString()) {
+    const staleHours = Math.max(1, Number(staleAfterHours || 1440));
     const staleThreshold = new Date(Date.parse(nowIso) - staleHours * 60 * 60 * 1000).toISOString();
     return this.db
       .prepare(
         `SELECT *
          FROM opportunities
          WHERE status IN ('active', 'unverified')
-           AND last_seen_at >= ?
-           AND (deadline_at IS NULL OR deadline_at >= ?)
+           AND (
+             (deadline_at IS NOT NULL AND deadline_at >= ?)
+             OR (deadline_at IS NULL AND last_seen_at >= ?)
+           )
          ORDER BY
+           CASE WHEN deadline_at IS NOT NULL AND deadline_at >= ? THEN 0 ELSE 1 END,
            CASE status WHEN 'active' THEN 0 ELSE 1 END,
            CASE section WHEN 'cex' THEN 0 ELSE 1 END,
            CASE type
@@ -629,11 +820,54 @@ export class DbClient {
              WHEN 'short_term' THEN 3
              ELSE 4
            END,
+           CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END,
+           deadline_at ASC,
            COALESCE(apy, 0) DESC,
            last_seen_at DESC
          LIMIT 200`
       )
-      .all(staleThreshold, nowIso)
+      .all(nowIso, staleThreshold, nowIso)
+      .map((row) => ({
+        ...row,
+        apy: row.apy === null || row.apy === undefined ? null : Number(row.apy)
+      }));
+  }
+
+  hasOpportunityRunSince(startIso, endIso = new Date().toISOString()) {
+    if (!startIso || !endIso) return false;
+    const row = this.db
+      .prepare(
+        `SELECT id
+         FROM opportunity_runs
+         WHERE started_at >= ? AND started_at < ?
+           AND status IN ('ok', 'partial')
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+      .get(startIso, endIso);
+    return Boolean(row?.id);
+  }
+
+  getOpportunitiesSeenSince(startIso, endIso = new Date().toISOString(), types = [], limit = 8) {
+    const selectedTypes = Array.isArray(types) ? types.map((type) => String(type || "").trim()).filter(Boolean) : [];
+    if (!startIso || !endIso || selectedTypes.length === 0) return [];
+    const placeholders = selectedTypes.map(() => "?").join(", ");
+    return this.db
+      .prepare(
+        `SELECT *
+         FROM opportunities
+         WHERE last_seen_at >= ? AND last_seen_at < ?
+           AND status IN ('active', 'unverified')
+           AND type IN (${placeholders})
+         ORDER BY
+           CASE type WHEN 'launch' THEN 0 WHEN 'pre_tge' THEN 1 ELSE 2 END,
+           CASE status WHEN 'active' THEN 0 ELSE 1 END,
+           CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END,
+           deadline_at ASC,
+           last_seen_at DESC
+         LIMIT ?`
+      )
+      .all(startIso, endIso, ...selectedTypes, Math.max(1, Math.min(30, Number(limit || 8))))
       .map((row) => ({
         ...row,
         apy: row.apy === null || row.apy === undefined ? null : Number(row.apy)
@@ -703,6 +937,51 @@ export class DbClient {
     if (!reportDate) return false;
     const row = this.db.prepare(`SELECT report_date FROM daily_reports WHERE report_date = ? LIMIT 1`).get(reportDate);
     return Boolean(row?.report_date);
+  }
+
+  getBinanceMajorNewsRun(reportDate) {
+    if (!reportDate) return null;
+    const row = this.db.prepare(`SELECT * FROM binance_major_news_runs WHERE report_date = ?`).get(reportDate);
+    if (!row) return null;
+    return {
+      ...row,
+      findings: safeParseJson(row.findings_json || "[]", []),
+      diagnostics: safeParseJson(row.diagnostics_json || "[]", [])
+    };
+  }
+
+  startBinanceMajorNewsRun(reportDate) {
+    if (!reportDate) return;
+    this.db
+      .prepare(
+        `INSERT INTO binance_major_news_runs (report_date, started_at, status)
+         VALUES (?, ?, 'running')
+         ON CONFLICT(report_date) DO UPDATE SET
+           started_at=excluded.started_at,
+           finished_at=NULL,
+           status='running',
+           error=NULL`
+      )
+      .run(reportDate, new Date().toISOString());
+  }
+
+  finishBinanceMajorNewsRun(reportDate, result = {}) {
+    if (!reportDate) return;
+    this.db
+      .prepare(
+        `UPDATE binance_major_news_runs
+         SET finished_at=?, status=?, universe_count=?, findings_json=?, diagnostics_json=?, error=?
+         WHERE report_date=?`
+      )
+      .run(
+        new Date().toISOString(),
+        result.status || "ok",
+        Number(result.universeCount || 0),
+        JSON.stringify(result.items || []),
+        JSON.stringify(result.diagnostics || []),
+        result.error || "",
+        reportDate
+      );
   }
 
   saveDailyReport({ reportDate, timezone, scheduledTime, payload }) {

@@ -644,7 +644,7 @@ function refreshStatus(item, now = new Date()) {
   const expired = Number.isFinite(deadlineMs) && deadlineMs < now.getTime();
   if (expired) return { ...item, status: "expired" };
   if (!item.source_url || !item.source_user || item.credibility === "unverified") return { ...item, status: "unverified" };
-  if ((item.type === "stablecoin_earn" || item.type === "launch" || item.type === "pre_ipo") && !item.deadline_at && item.deadline_source !== "no_fixed_deadline") {
+  if ((item.type === "stablecoin_earn" || item.type === "launch" || item.type === "pre_ipo" || item.type === "pre_tge") && !item.deadline_at && item.deadline_source !== "no_fixed_deadline") {
     return { ...item, status: "unverified" };
   }
   return { ...item, status: "active" };
@@ -704,7 +704,7 @@ function mergeEnrichment(item, enrichment) {
 
 function needsDeadlineEnrichment(item) {
   if (!item) return false;
-  if (!item.deadline_at && ["stablecoin_earn", "launch", "pre_ipo"].includes(item.type)) return true;
+  if (!item.deadline_at && ["stablecoin_earn", "launch", "pre_ipo", "pre_tge"].includes(item.type)) return true;
   if (!item.official_url && item.section === "cex") return true;
   if (!item.official_url && inferOfficialUrl(item).url) return true;
   if (item.official_url_source === "official_product" && inferOfficialUrl(item).source === "official_page") return true;
@@ -747,7 +747,7 @@ export async function enrichOpportunities(items, options = {}) {
 
   const now = options.now || new Date();
   const maxItems = Math.max(0, Number(config.opportunityEnrichmentMaxItems ?? 5));
-  const grokFallbackMax = Math.max(0, Number(config.opportunityGrokDeadlineFallbackMax ?? 2));
+  const grokFallbackMax = Math.max(0, Number(config.opportunityGrokDeadlineFallbackMax ?? 1));
   const timeoutMs = Math.max(1000, Number(config.opportunityOfficialCrawlTimeoutSec ?? 15) * 1000);
   const fetchFn = options.fetchFn || globalThis.fetch;
   const callHermes = options.callHermes;

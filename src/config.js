@@ -1,5 +1,7 @@
 ﻿import dotenv from "dotenv";
 
+import fs from "node:fs";
+
 dotenv.config();
 
 function toBool(value, defaultValue) {
@@ -24,6 +26,16 @@ function splitCsv(value) {
     .filter(Boolean);
 }
 
+function readSharedEnvValue(filePath, key) {
+  if (!filePath || !key) return "";
+  try {
+    const parsed = dotenv.parse(fs.readFileSync(filePath));
+    return String(parsed[key] || "").trim();
+  } catch {
+    return "";
+  }
+}
+
 function pickAiProvider() {
   const explicit = String(process.env.AI_PROVIDER || "").trim().toLowerCase();
   if (explicit) return explicit;
@@ -46,6 +58,7 @@ export const config = {
   level2CooldownMin: toInt(process.env.LEVEL2_COOLDOWN_MIN, 90),
 
   enableMarketConfirmation: toBool(process.env.ENABLE_MARKET_CONFIRMATION, true),
+  enableEngineCycle: toBool(process.env.ENABLE_ENGINE_CYCLE, true),
   enableXSource: toBool(process.env.ENABLE_X_SOURCE, true),
   enableGdeltSource: toBool(process.env.ENABLE_GDELT_SOURCE, true),
   enableRssSource: toBool(process.env.ENABLE_RSS_SOURCE, true),
@@ -96,35 +109,73 @@ export const config = {
   telegramMode: (process.env.TELEGRAM_MODE || "relay").toLowerCase(),
   telegramServiceUrl: process.env.TELEGRAM_BOT_API_URL || process.env.TELEGRAM_SERVICE_URL || "http://127.0.0.1:3000",
   telegramServicePath: process.env.TELEGRAM_SERVICE_PATH || "/send-message",
-  telegramApiKey: process.env.TELEGRAM_API_KEY || process.env.API_KEY || "",
+  telegramApiKey:
+    process.env.TELEGRAM_API_KEY ||
+    process.env.API_KEY ||
+    readSharedEnvValue(process.env.TELEGRAM_SHARED_ENV_PATH, "API_KEY"),
   telegramApiKeyHeader: process.env.TELEGRAM_API_KEY_HEADER || "X-API-Key",
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
   telegramChatId: process.env.TELEGRAM_CHAT_ID || "",
   dailyReportEnabled: toBool(process.env.DAILY_REPORT_ENABLED, true),
-  dailyReportTimeBj: process.env.DAILY_REPORT_TIME_BJ || "16:43",
+  dailyReportTimeBj: process.env.DAILY_REPORT_TIME_BJ || "19:04",
+  dailyReportChatId: process.env.DAILY_REPORT_CHAT_ID || "-5535517204",
   dailyReportCheckIntervalSec: toInt(process.env.DAILY_REPORT_CHECK_INTERVAL_SEC, 30),
   dailyReportMaxEvents: toInt(process.env.DAILY_REPORT_MAX_EVENTS, 5),
   dailyReportMessageMaxChars: toInt(process.env.DAILY_REPORT_MESSAGE_MAX_CHARS, 1200),
 
   opportunityMonitorEnabled: toBool(process.env.OPPORTUNITY_MONITOR_ENABLED, true),
-  opportunityIntervalSec: toInt(process.env.OPPORTUNITY_INTERVAL_SEC, 900),
+  opportunityIntervalSec: toInt(process.env.OPPORTUNITY_INTERVAL_SEC, 86400),
+  opportunityScheduleMode: (process.env.OPPORTUNITY_SCHEDULE_MODE || "daily_report").toLowerCase(),
+  opportunityCollectionTypes: splitCsv(process.env.OPPORTUNITY_COLLECTION_TYPES || "launch,pre_tge"),
+  opportunityDailyReportEnabled: toBool(process.env.OPPORTUNITY_DAILY_REPORT_ENABLED, true),
+  opportunityDailyReportTimeBj: process.env.OPPORTUNITY_DAILY_REPORT_TIME_BJ || process.env.DAILY_REPORT_TIME_BJ || "19:04",
+  opportunityDailyReportChatId:
+    process.env.OPPORTUNITY_DAILY_REPORT_CHAT_ID || process.env.DAILY_REPORT_CHAT_ID || "-5535517204",
+  opportunityDailyReportMaxItems: toInt(process.env.OPPORTUNITY_DAILY_REPORT_MAX_ITEMS, 8),
+  opportunityDailyReportMaxChars: toInt(process.env.OPPORTUNITY_DAILY_REPORT_MAX_CHARS, 3500),
   opportunityHermesBin: process.env.OPPORTUNITY_HERMES_BIN || "hermes",
   opportunityHermesProfile: process.env.OPPORTUNITY_HERMES_PROFILE || "xintel",
   opportunityHermesTimeoutSec: toInt(process.env.OPPORTUNITY_HERMES_TIMEOUT_SEC, 240),
-  opportunityLookbackHours: toInt(process.env.OPPORTUNITY_LOOKBACK_HOURS, 72),
-  opportunityStaleAfterHours: toInt(process.env.OPPORTUNITY_STALE_AFTER_HOURS, 96),
-  opportunityMaxFollowups: toInt(process.env.OPPORTUNITY_MAX_FOLLOWUPS, 3),
-  opportunityFocusedQueriesEnabled: toBool(process.env.OPPORTUNITY_FOCUSED_QUERIES_ENABLED, true),
+  xintelHermesMaxConcurrency: toInt(process.env.XINTEL_HERMES_MAX_CONCURRENCY, 1),
+  xintelHermesMinIntervalMs: toInt(process.env.XINTEL_HERMES_MIN_INTERVAL_MS, 5000),
+  opportunityLookbackHours: toInt(process.env.OPPORTUNITY_LOOKBACK_HOURS, 24),
+  opportunityStaleAfterHours: toInt(process.env.OPPORTUNITY_STALE_AFTER_HOURS, 1440),
+  opportunityMaxFollowups: toInt(process.env.OPPORTUNITY_MAX_FOLLOWUPS, 1),
+  opportunityFocusedQueriesEnabled: toBool(process.env.OPPORTUNITY_FOCUSED_QUERIES_ENABLED, false),
   opportunityQueryMatrixEnabled: toBool(process.env.OPPORTUNITY_QUERY_MATRIX_ENABLED, true),
   opportunityAdaptiveQueryPlanEnabled: toBool(process.env.OPPORTUNITY_ADAPTIVE_QUERY_PLAN_ENABLED, true),
-  opportunityMaxQueryJobs: toInt(process.env.OPPORTUNITY_MAX_QUERY_JOBS, 5),
+  opportunityMaxQueryJobs: toInt(process.env.OPPORTUNITY_MAX_QUERY_JOBS, 3),
+  opportunityEmptyResponseBackoffSec: toInt(process.env.OPPORTUNITY_EMPTY_RESPONSE_BACKOFF_SEC, 3600),
+  opportunityQuotaErrorBackoffSec: toInt(process.env.OPPORTUNITY_QUOTA_ERROR_BACKOFF_SEC, 43200),
   opportunityEnrichmentEnabled: toBool(process.env.OPPORTUNITY_ENRICHMENT_ENABLED, true),
   opportunityEnrichmentMaxItems: toInt(process.env.OPPORTUNITY_ENRICHMENT_MAX_ITEMS, 5),
   opportunityExistingEnrichmentMaxItems: toInt(process.env.OPPORTUNITY_EXISTING_ENRICHMENT_MAX_ITEMS, 2),
   opportunityEnrichmentRetryCooldownHours: toInt(process.env.OPPORTUNITY_ENRICHMENT_RETRY_COOLDOWN_HOURS, 12),
   opportunityOfficialCrawlTimeoutSec: toInt(process.env.OPPORTUNITY_OFFICIAL_CRAWL_TIMEOUT_SEC, 15),
   opportunityGrokDeadlineFallbackEnabled: toBool(process.env.OPPORTUNITY_GROK_DEADLINE_FALLBACK_ENABLED, true),
-  opportunityGrokDeadlineFallbackMax: toInt(process.env.OPPORTUNITY_GROK_DEADLINE_FALLBACK_MAX, 2),
+  opportunityGrokDeadlineFallbackMax: toInt(process.env.OPPORTUNITY_GROK_DEADLINE_FALLBACK_MAX, 1),
+
+  binanceMajorNewsEnabled: toBool(process.env.BINANCE_MAJOR_NEWS_ENABLED, true),
+  binanceMajorNewsCollectionTimeBj: process.env.BINANCE_MAJOR_NEWS_COLLECTION_TIME_BJ || "18:15",
+  binanceMajorNewsDailyTimeBj: process.env.BINANCE_MAJOR_NEWS_DAILY_TIME_BJ || "19:01",
+  binanceMajorNewsDailyChatId:
+    process.env.BINANCE_MAJOR_NEWS_DAILY_CHAT_ID || process.env.DAILY_REPORT_CHAT_ID || "-5535517204",
+  binanceMajorNewsChunkSize: toInt(process.env.BINANCE_MAJOR_NEWS_CHUNK_SIZE, 60),
+  binanceMajorNewsTimeoutSec: toInt(process.env.BINANCE_MAJOR_NEWS_HTTP_TIMEOUT_SEC, 20),
+  binanceMajorNewsMaxItems: toInt(process.env.BINANCE_MAJOR_NEWS_MAX_ITEMS, 30),
+  binanceMajorNewsMessageMaxChars: toInt(process.env.BINANCE_MAJOR_NEWS_MESSAGE_MAX_CHARS, 3800),
+  binanceMajorNewsMarketDatabaseUrl:
+    process.env.BINANCE_MAJOR_NEWS_MARKET_DATABASE_URL ||
+    "postgres://market_engine:market_engine@127.0.0.1:5432/market_engine",
+  binanceMajorNewsMarketStatementTimeoutMs: toInt(process.env.BINANCE_MAJOR_NEWS_MARKET_STATEMENT_TIMEOUT_MS, 5000),
+  binanceMajorNewsMarketPriceMaxAgeMinutes: toInt(process.env.BINANCE_MAJOR_NEWS_MARKET_PRICE_MAX_AGE_MINUTES, 45),
+  binanceMajorNewsMarketCapMaxAgeHours: toInt(process.env.BINANCE_MAJOR_NEWS_MARKET_CAP_MAX_AGE_HOURS, 36),
+
+  securityIncidentMonitorEnabled: toBool(process.env.SECURITY_INCIDENT_MONITOR_ENABLED, true),
+  securityIncidentIntervalSec: toInt(process.env.SECURITY_INCIDENT_INTERVAL_SEC, 1200),
+  securityIncidentLargeUsd: toInt(process.env.SECURITY_INCIDENT_LARGE_USD, 5000000),
+  securityIncidentCriticalChatId: process.env.SECURITY_INCIDENT_CRITICAL_CHAT_ID || "-5519280405",
+  securityIncidentAnomalyChatId: process.env.SECURITY_INCIDENT_ANOMALY_CHAT_ID || "-5363003109",
 
   keywordsFile: process.env.KEYWORDS_FILE || "./config/keywords.txt",
   suppressKeywordsFile: process.env.SUPPRESS_KEYWORDS_FILE || "./config/suppress_keywords.txt",

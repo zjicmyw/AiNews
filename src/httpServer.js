@@ -6,6 +6,7 @@ import { parseMaxApyPercent } from "./opportunityUtils.js";
 const OPPORTUNITY_TYPE_LABELS = {
   stablecoin_earn: "稳定币理财",
   launch: "打新",
+  pre_tge: "Pre-TGE",
   pre_ipo: "Pre-IPO",
   short_term: "短期临时",
   onchain: "链上/DEX"
@@ -20,11 +21,18 @@ const DEADLINE_SOURCE_LABELS = {
   unverified: "待确认"
 };
 
+const DISPLAY_CATEGORY_LABELS = {
+  stablecoin_yield: "稳定币高息",
+  quick_opportunity: "短期机会",
+  watch_opportunity: "观察项"
+};
+
 function groupOpportunities(rows) {
   const bySection = { cex: [], onchain: [] };
   const byType = {
     stablecoin_earn: [],
     launch: [],
+    pre_tge: [],
     pre_ipo: [],
     short_term: [],
     onchain: []
@@ -49,6 +57,8 @@ function csvEscape(value) {
 function buildOpportunitiesCsv(items) {
   const columns = [
     ["活动名称", (item) => item.activity_name],
+    ["展示分类", (item) => DISPLAY_CATEGORY_LABELS[item.display_category] || OPPORTUNITY_TYPE_LABELS[item.type] || item.type],
+    ["展示理由", (item) => item.display_reason],
     ["类型", (item) => OPPORTUNITY_TYPE_LABELS[item.type] || item.type],
     ["状态", (item) => item.review?.label || item.status],
     ["交易所/项目", (item) => item.exchange || item.venue],
@@ -58,6 +68,13 @@ function buildOpportunitiesCsv(items) {
     ["APY", (item) => item.apy],
     ["最高APY", (item) => item.yield_profile?.max_apy ?? item.apy],
     ["入库/常规APY", (item) => item.yield_profile?.base_apy ?? item.apy],
+    ["事件类型", (item) => item.campaign_profile?.event_type],
+    ["平台路径", (item) => item.campaign_profile?.platform_path],
+    ["额度", (item) => item.campaign_profile?.quota_label],
+    ["派息", (item) => item.campaign_profile?.payout_label],
+    ["锁仓/赎回", (item) => item.campaign_profile?.lock_label],
+    ["到期/剩余", (item) => item.campaign_profile?.time_left_label],
+    ["估算收益", (item) => item.campaign_profile?.estimated_return_label],
     ["收益性质", (item) => item.yield_profile?.summary],
     ["收益条件", (item) => (item.yield_profile?.qualifiers || []).join("、")],
     ["收益/奖励", (item) => item.reward || item.expected_yield],
@@ -83,8 +100,785 @@ function buildOpportunitiesCsv(items) {
   ].join("\n");
 }
 
+const DISPLAY_STABLECOINS = new Set(["USDT", "USDC", "USD1"]);
+
+const EXCLUDED_OPPORTUNITY_PATTERNS = [
+  /invite/i,
+  /referral/i,
+  /leaderboard/i,
+  /\brank(?:ing)?\b/i,
+  /volume competition/i,
+  /trading competition/i,
+  /trade-to-earn/i,
+  /candybomb/i,
+  /share .*pool .*volume/i,
+  /trading volume/i,
+  /交易量排名/,
+  /交易量/,
+  /交易比赛/,
+  /交易竞赛/,
+  /排行榜/,
+  /排名/,
+  /邀请好友/,
+  /邀请/,
+  /拉新/,
+  /抽奖/,
+  /神秘盒子/,
+  /瓜分.*奖池/,
+  /奖池.*瓜分/
+];
+
+function displayTextForOpportunity(item) {
+  return [
+    item.activity_name,
+    item.type,
+    item.exchange,
+    item.venue,
+    item.asset,
+    item.stablecoin,
+    item.expected_yield,
+    item.reward,
+    item.duration,
+    item.deadline_text,
+    item.participation,
+    item.risk_note,
+    item.source_user
+  ]
+    .filter(Boolean)
+    .join(" \n ");
+}
+
+function normalizedOpportunityText(item) {
+  return displayTextForOpportunity(item).toLowerCase();
+}
+
+function parseCampaignDays(text) {
+  const value = String(text || "");
+  const matches = [
+    ...value.matchAll(/(\d+(?:\.\d+)?)\s*[-\s]?(?:day|days|天|日)/gi),
+    ...value.matchAll(/(?:lock(?:ed|up)?|fixed|term|duration|period|redeem|redemption|锁仓|定期|固定|期限|赎回)[^\d]{0,18}(\d+(?:\.\d+)?)/gi)
+  ]
+    .map((match) => Number(match[1]))
+    .filter((days) => Number.isFinite(days) && days > 0 && days <= 730);
+  return matches.length ? Math.max(...matches) : null;
+}
+
+function inferCampaignEventType(row = {}) {
+  const text = normalizedOpportunityText(row);
+  if (row.type === "pre_tge" || /pre[-\s]?tge|token generation|代币生成/.test(text)) return "Pre-TGE";
+  if (row.type === "pre_ipo" || /pre[-\s]?ipo|pre[-\s]?market|预上市|上市前/.test(text)) return "Pre-IPO";
+  if (row.type === "stablecoin_earn") {
+    if (/flexible|simple earn|soft staking|活期|灵活|no lock|无锁|redeem anytime|随时赎回/.test(text)) return "活期";
+    if (/fixed earn|fixed|locked|lockup|lock-up|定期|固定期限|锁仓/.test(text)) return "锁定";
+    return "活期";
+  }
+  if (row.type === "launch" || /launchpad|launchpool|startup|ieo|ido|ico|打新/.test(text)) return "打新";
+  if (row.section === "onchain" || /onchain|dex|dapp|defi|链上/.test(text)) return "链上";
+  if (/flexible|simple earn|soft staking|活期|灵活|no lock|无锁|redeem anytime|随时赎回/.test(text)) return "活期";
+  if (/fixed earn|fixed|locked|lockup|lock-up|定期|固定期限|锁仓/.test(text)) return "锁定";
+  return OPPORTUNITY_TYPE_LABELS[row.type] || "活动";
+}
+
+function buildCampaignPlatformPath(row = {}, eventType = "活动") {
+  const text = normalizedOpportunityText(row);
+  const venue = row.exchange || row.venue || "未知平台";
+  if (row.section === "onchain") return `${venue} → 链上`;
+  const entry = /wallet|web3|dapp|钱包/i.test(`${row.venue || ""} ${row.participation || ""} ${text}`) ? "钱包" : "主站";
+  return `${venue} ${entry} → ${eventType}`;
+}
+
+function formatCampaignAmount(rawAmount, rawCurrency = "") {
+  const amount = Number(String(rawAmount || "").replace(/,/g, ""));
+  if (!Number.isFinite(amount)) return "";
+  const formatted = amount.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  const currency = String(rawCurrency || "").toUpperCase();
+  if (!currency || currency === "USD" || currency === "美元") return `$${formatted}`;
+  return `${formatted} ${currency}`;
+}
+
+function parseCampaignQuota(row = {}) {
+  const text = displayTextForOpportunity(row);
+  if (/unlimited|no cap|no limit|无限额|不限额度|无上限/i.test(text)) {
+    return { quota_label: "无限额", quota_type: "unlimited" };
+  }
+  const amountPatterns = [
+    /(?:quota|cap|limit|allocation|max(?:imum)?|capacity|额度|限额|配额|上限|最多|单人|每人|\/人)[^\d$＄]{0,24}(?:\$|＄)?\s*([0-9][0-9,]*(?:\.\d+)?)\s*(USDT|USDC|USD1|USD|U|美元)?/i,
+    /(?:\$|＄)?\s*([0-9][0-9,]*(?:\.\d+)?)\s*(USDT|USDC|USD1|USD|U|美元)\s*(?:quota|cap|limit|allocation|额度|限额|配额|上限|per user|\/人|每人|单人)/i
+  ];
+  for (const pattern of amountPatterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const amount = formatCampaignAmount(match[1], match[2]);
+    if (amount) return { quota_label: `额度 ${amount}`, quota_type: "capped" };
+  }
+  if (/quota|cap|limit|allocation|limited pool|first-come|额度|限额|配额|限池|先到先得/i.test(text)) {
+    return { quota_label: "额度有限", quota_type: "capped" };
+  }
+  return { quota_label: "额度待核验", quota_type: "unknown" };
+}
+
+function parseCampaignPayout(row = {}) {
+  const text = displayTextForOpportunity(row);
+  if (/hourly payout|hourly rewards?|每小时派息|每小时发放|按小时派息|小时派息/i.test(text)) return "每小时派息";
+  if (/daily payout|daily rewards?|daily interest|每天派息|每日派息|每日发放|按日发放|按日派息/i.test(text)) return "每天派息";
+  if (/weekly payout|weekly rewards?|每周派息|每周发放|按周派息/i.test(text)) return "每周派息";
+  if (/monthly payout|monthly rewards?|每月派息|每月发放|按月派息/i.test(text)) return "每月派息";
+  if (/real[-\s]?time apr|real[-\s]?time rewards?|实时\s*(?:apr|apy|奖励|计息|派息)/i.test(text)) return "实时计息";
+  return "派息待核验";
+}
+
+function parseCampaignLock(row = {}) {
+  const text = displayTextForOpportunity(row);
+  const redeemMatch = text.match(/(?:redeem|redemption|赎回)[^\d]{0,18}(\d+(?:\.\d+)?)\s*(?:day|days|天|日)/i);
+  if (redeemMatch) {
+    const days = Number(redeemMatch[1]);
+    if (Number.isFinite(days)) {
+      return { lock_label: `赎回 ${Math.round(days)} 天`, lock_type: "locked", lock_days: days };
+    }
+  }
+  const lockDays = parseCampaignDays(text);
+  if (Number.isFinite(lockDays) && /fixed|locked|lockup|lock-up|term|duration|定期|固定|锁仓|期限/i.test(text)) {
+    return { lock_label: `锁仓 ${Math.round(lockDays)} 天`, lock_type: "locked", lock_days: lockDays };
+  }
+  if (/flexible|simple earn|soft staking|活期|灵活|no lock|无锁|redeem anytime|随时赎回/i.test(text)) {
+    return { lock_label: "无锁仓", lock_type: "flexible", lock_days: null };
+  }
+  return { lock_label: "锁仓待核验", lock_type: "unknown", lock_days: null };
+}
+
+function buildCampaignTimeLeft(row = {}, urgency = {}) {
+  const hasHoursLeft = urgency.hours_left !== null && urgency.hours_left !== undefined && urgency.hours_left !== "";
+  const hoursLeft = hasHoursLeft ? Number(urgency.hours_left) : Number.NaN;
+  if (Number.isFinite(hoursLeft)) {
+    if (hoursLeft < 0) return "已过期";
+    if (hoursLeft < 24) return `还剩 ${Math.max(1, Math.ceil(hoursLeft))} 小时`;
+    if (hoursLeft > 24 * 90) return "长期";
+    return `还剩 ${Math.ceil(hoursLeft / 24)} 天`;
+  }
+  if (row.deadline_source === "no_fixed_deadline") return "长期";
+  return "截止待确认";
+}
+
+function buildCampaignEstimatedReturn(row = {}, yieldProfile = {}, urgency = {}, lockDays = null) {
+  const apy = Number(yieldProfile.eligible_apy ?? yieldProfile.max_apy ?? row.apy);
+  if (!Number.isFinite(apy) || apy <= 0) {
+    return {
+      estimated_return_label: "收益需核验",
+      estimated_return_usd: null,
+      estimate_period_days: null,
+      estimate_basis: "unknown"
+    };
+  }
+
+  const principal = 10_000;
+  const hasHoursLeft = urgency.hours_left !== null && urgency.hours_left !== undefined && urgency.hours_left !== "";
+  const hoursLeft = hasHoursLeft ? Number(urgency.hours_left) : Number.NaN;
+  let days = null;
+  let basis = "预期一个月";
+  let amount = principal * (apy / 100) / 12;
+
+  if (Number.isFinite(lockDays) && lockDays > 0) {
+    days = lockDays;
+    basis = `${Math.round(lockDays)} 天锁仓`;
+    amount = principal * (apy / 100) * (lockDays / 365);
+  } else if (Number.isFinite(hoursLeft) && hoursLeft > 0 && hoursLeft <= 24 * 90) {
+    days = Math.max(1, hoursLeft / 24);
+    basis = `${Math.ceil(days)} 天到期`;
+    amount = principal * (apy / 100) * (days / 365);
+  }
+
+  const estimated = Math.round(amount * 100) / 100;
+  return {
+    estimated_return_label: `$10,000 本金预期收益 $${estimated.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}（${basis}）`,
+    estimated_return_usd: estimated,
+    estimate_period_days: days,
+    estimate_basis: basis
+  };
+}
+
+function buildOpportunityCampaignProfile(row = {}, yieldProfile = {}, urgency = {}) {
+  const eventType = inferCampaignEventType(row);
+  const quota = parseCampaignQuota(row);
+  const lock = parseCampaignLock(row);
+  const estimate = buildCampaignEstimatedReturn(row, yieldProfile, urgency, lock.lock_days);
+  return {
+    event_type: eventType,
+    platform_path: buildCampaignPlatformPath(row, eventType),
+    quota_label: quota.quota_label,
+    quota_type: quota.quota_type,
+    payout_label: parseCampaignPayout(row),
+    lock_label: lock.lock_label,
+    lock_type: lock.lock_type,
+    lock_days: lock.lock_days,
+    time_left_label: buildCampaignTimeLeft(row, urgency),
+    ...estimate
+  };
+}
+
+function maxOpportunityApy(item) {
+  const candidates = [
+    item.yield_profile?.max_apy,
+    item.apy,
+    parseMaxApyPercent(item)
+  ]
+    .map(Number)
+    .filter(Number.isFinite);
+  return candidates.length ? Math.max(...candidates) : null;
+}
+
+function parseUsdReward(text) {
+  const normalized = String(text || "").replace(/,/g, "");
+  const matches = [
+    ...normalized.matchAll(/(?:>=|至少|不少于|保底|固定|可得|获得|返|奖励)?\s*(\d+(?:\.\d+)?)\s*(?:U|USDT|USDC|USD|美元)/gi),
+    ...normalized.matchAll(/(?:\$|＄)\s*(\d+(?:\.\d+)?)/g)
+  ];
+  const values = matches.map((match) => Number(match[1])).filter(Number.isFinite);
+  return values.length ? Math.max(...values) : null;
+}
+
+function parseTimeCostMinutes(text) {
+  const value = String(text || "");
+  const minuteMatch = value.match(/(\d+(?:\.\d+)?)\s*(?:分钟|min|mins|minutes)/i);
+  if (minuteMatch) return Number(minuteMatch[1]);
+  const hourMatch = value.match(/(\d+(?:\.\d+)?)\s*(?:小时|h|hour|hours)/i);
+  if (hourMatch) return Number(hourMatch[1]) * 60;
+  if (/10\s*分钟|十分钟/.test(value)) return 10;
+  if (/2\s*小时|两小时|二小时/.test(value)) return 120;
+  return null;
+}
+
+function hasDayScaleDuration(text) {
+  return /(\d+\s*(?:天|日|days?))|按天|每日|daily|锁仓|定期/i.test(String(text || ""));
+}
+
+function isQuickOpportunityType(item, text) {
+  if (["launch", "pre_tge", "pre_ipo"].includes(item.type)) return true;
+  return /(IPO|IEO|ICO|IDO|Launch|Launchpad|Pre-TGE|Pre-IPO|Pre-token|Pre-listing|Pre-market|打新|新币|认购|申购|预售|上市前)/i.test(text);
+}
+
+function hasNewUserTerm(text) {
+  return /new users?|new customer|first[-\s]?time|新户|新用户|新客|首次/i.test(String(text || ""));
+}
+
+function hasCurrentUserTerm(text) {
+  return /existing users?|existing|standard|regular|base|ordinary|all users?|current users?|老用户|现有用户|普通用户|标准|基础|基准|所有用户|全体用户|新老用户|老客|非新户/i.test(
+    String(text || "")
+  );
+}
+
+function hasNewUserOnlyTerm(text) {
+  return /new users? only|for new users?|new customer only|new user exclusive|新户限定|新户专属|新用户专享|新客专享|仅限新|只限新|首次专享/i.test(
+    String(text || "")
+  );
+}
+
+function splitOpportunityTextSegments(text) {
+  return String(text || "")
+    .split(/(?:\s+\/\s+)|[;；。,\n，]/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+function isNewUserOnlyApySegment(text) {
+  const value = String(text || "");
+  return hasNewUserOnlyTerm(value) || (hasNewUserTerm(value) && !hasCurrentUserTerm(value) && /%|a\.?p\.?y\.?|a\.?p\.?r\.?|annual|年化|收益|利率|rate/i.test(value));
+}
+
+function isNewUserOnlyOpportunity(item) {
+  const text = displayTextForOpportunity(item);
+  const hasNewUserOnlySegment = splitOpportunityTextSegments(text).some(isNewUserOnlyApySegment);
+  if (!hasNewUserOnlySegment) return false;
+  if (hasCurrentUserTerm(text) && Number.isFinite(parseMaxApyPercent(item))) return false;
+  return true;
+}
+
+function opportunityYieldValue(item) {
+  const candidates = [item.yield_profile?.eligible_apy, item.yield_profile?.max_apy, item.apy]
+    .map(Number)
+    .filter(Number.isFinite);
+  return candidates.length ? Math.max(...candidates) : 0;
+}
+
+const KNOWN_TOKEN_SYMBOLS = [
+  "USDGO",
+  "USD1",
+  "USDC",
+  "USDT",
+  "SPCX",
+  "PRESPCX",
+  "PREOPAI",
+  "KGEN",
+  "TRUST",
+  "BLESS",
+  "LINEA",
+  "WLD",
+  "ETH",
+  "XAUT",
+  "SOL",
+  "BNB",
+  "BTC"
+];
+
+const ACTIVITY_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "app",
+  "binance",
+  "bitget",
+  "bybit",
+  "cex",
+  "com",
+  "crypto",
+  "earn",
+  "exchange",
+  "flexible",
+  "for",
+  "gate",
+  "gateio",
+  "io",
+  "limited",
+  "market",
+  "markets",
+  "okx",
+  "official",
+  "reward",
+  "rewards",
+  "simple",
+  "the",
+  "to",
+  "users",
+  "wallet",
+  "web3",
+  "with",
+  "活动",
+  "官方",
+  "奖励",
+  "用户",
+  "参与",
+  "报名",
+  "钱包",
+  "交易所"
+]);
+
+const GENERIC_ACTIVITY_ASSETS = new Set([
+  "AIRDROP",
+  "CAMPAIGN",
+  "EVENT",
+  "FOOTBALL",
+  "MARKET",
+  "MARKETS",
+  "PREDICT",
+  "PREDICTION",
+  "PREDICTIONMARKETS",
+  "REWARD",
+  "REWARDS",
+  "TASK",
+  "TASKS"
+]);
+
+function normalizeTokenSymbol(value) {
+  const text = String(value || "").toUpperCase();
+  if (!text) return "";
+  for (const token of KNOWN_TOKEN_SYMBOLS) {
+    if (new RegExp(`\\b${token}\\b`, "i").test(text)) return token;
+  }
+  const compact = text.replace(/[^A-Z0-9]/g, "");
+  const wordCount = text
+    .split(/[^A-Z0-9]+/)
+    .map((word) => word.trim())
+    .filter(Boolean).length;
+  if (wordCount <= 1 && compact.length >= 2 && compact.length <= 18 && !GENERIC_ACTIVITY_ASSETS.has(compact)) return compact;
+  return "";
+}
+
+function campaignAssetSymbol(item = {}) {
+  const asset = normalizeTokenSymbol(item.asset);
+  if (asset) return asset;
+  const stablecoin = normalizeTokenSymbol(item.stablecoin);
+  if (stablecoin) return stablecoin;
+  return normalizeTokenSymbol(`${item.activity_name || ""} ${item.expected_yield || ""} ${item.reward || ""}`);
+}
+
+function normalizeActivityWords(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[@#]/g, " ")
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/gi, " ")
+    .split(/\s+/)
+    .map((word) => word.trim())
+    .filter((word) => word.length >= 2 && !/^\d+$/.test(word) && !ACTIVITY_STOP_WORDS.has(word));
+}
+
+function campaignNameSignature(item = {}) {
+  const primary = normalizeActivityWords([item.activity_name, item.venue, item.asset].filter(Boolean).join(" "));
+  const words = primary.length >= 2 ? primary : normalizeActivityWords(displayTextForOpportunity(item));
+  return words.slice(0, 6).join("-");
+}
+
+function inferCampaignFamily(item = {}) {
+  const text = normalizedOpportunityText(item);
+  if (item.type === "stablecoin_earn" || item.display_category === "stablecoin_yield") return "earn";
+  if (item.type === "pre_tge" || /pre[-\s]?tge|token generation|代币生成/.test(text)) return "pre_tge";
+  if (/football|soccer|world cup|prediction markets?|predict\.?fun|预测|足球/.test(text)) return "football_prediction";
+  if (/candy\s*drop|candydrop/.test(text)) return "candydrop";
+  if (/candy\s*bomb|candybomb/.test(text)) return "candybomb";
+  if (/alpha[\s\S]{0,80}(airdrop|points?|空投|积分)|(airdrop|空投)[\s\S]{0,80}alpha/.test(text)) return "alpha_airdrop";
+  if (/pre[-\s]?ipo|ipo express|tokenized shares?|stocks? perps?|perpetual|pre[-\s]?market|pre[-\s]?token|pre[-\s]?listing|上市前|预上市|股份|认购/.test(text)) {
+    if (/perps?|perpetual|futures?|合约|永续/.test(text)) return "pre_ipo_perps";
+    if (/ipo express|tokenized shares?|stock|stocks|股份|认购/.test(text)) return "ipo_express";
+    return "pre_ipo";
+  }
+  if (/launchpad|launchpool|startup|jumpstart|poolx|megadrop|hodler|ieo|ido|ico|打新|新币|申购/.test(text)) return "launch";
+  if (/xstocks?|tokenized stock|股票代币/.test(text)) return "xstocks_campaign";
+  if (/convert challenge|convert.*challenge|闪兑.*挑战|兑换.*挑战/.test(text)) return "convert_challenge";
+  if (/cryptopedia|learn.?to.?earn|fan club|task campaign|任务/.test(text)) return "task_campaign";
+  if (/points?|airdrop|multiplier|积分|空投/.test(text)) return "points_airdrop";
+  if (item.section === "onchain" && /vault|farm|lp|liquidity|staking|池|金库|流动性/.test(text)) return "vault_yield";
+  if (/prediction|predict|预测/.test(text)) return "prediction";
+  const fallback = item.type || item.display_category || inferCampaignEventType(item);
+  return String(fallback || "activity")
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function campaignDedupeSubject(item = {}, family = inferCampaignFamily(item)) {
+  const asset = campaignAssetSymbol(item);
+  const stablecoin = normalizeTokenSymbol(item.stablecoin);
+  const text = normalizedOpportunityText(item);
+  if (family === "earn" && asset) return { subject: asset, basis: "asset" };
+  if (family === "football_prediction") return { subject: "football", basis: "event_theme" };
+  if (asset && asset !== stablecoin && !GENERIC_ACTIVITY_ASSETS.has(asset)) {
+    return { subject: asset, basis: "asset" };
+  }
+  if (/space\s*x|spacex/.test(text)) return { subject: "spacex", basis: "event_theme" };
+  if (/openai|open ai/.test(text)) return { subject: "openai", basis: "event_theme" };
+  const signature = campaignNameSignature(item);
+  return signature ? { subject: signature, basis: "name_signature" } : { subject: "", basis: "none" };
+}
+
+function canonicalOpportunityPlatform(item = {}) {
+  const text = String(item.exchange || item.venue || "").toLowerCase();
+  if (!text) return "";
+  if (text.includes("binance")) return "binance";
+  if (text.includes("bitget")) return "bitget";
+  if (text.includes("gate")) return "gate";
+  if (text.includes("bybit")) return "bybit";
+  if (text.includes("okx")) return "okx";
+  return text.replace(/\b(exchange|earn|finance|wallet|web3|app|\.io|\.com)\b/g, "").replace(/[^a-z0-9]+/g, "");
+}
+
+function opportunityDedupKey(item = {}) {
+  const platform = canonicalOpportunityPlatform(item);
+  if (!platform) return null;
+  const family = inferCampaignFamily(item);
+  const { subject } = campaignDedupeSubject(item, family);
+  if (!subject) return null;
+  const eventType = item.campaign_profile?.event_type || inferCampaignEventType(item);
+  return ["activity", platform, family, subject, eventType].join("|").toLowerCase();
+}
+
+function duplicateRepresentativeRank(item = {}) {
+  const displayRank = ({ stablecoin_yield: 0, quick_opportunity: 1, watch_opportunity: 2 })[item.display_category] ?? 3;
+  const reviewRank = item.review?.label === "可参与" ? 0 : item.review?.label === "待核验" ? 1 : item.review?.label === "观察项" ? 2 : 3;
+  const credibilityRank = item.credibility === "official" ? 0 : item.credibility === "kol" ? 1 : 2;
+  const platform = canonicalOpportunityPlatform(item);
+  const sourceUser = String(item.source_user || "").toLowerCase();
+  const sourceHandle = sourceUser.replace(/^@/, "");
+  const sourceRank = platform && sourceHandle === platform ? 0 : platform && sourceHandle.includes(platform) ? 1 : 2;
+  const officialRank = item.official_url ? 0 : 1;
+  const timestamp = Date.parse(item.source_published_at || item.first_seen_at || item.last_seen_at || "");
+  return [
+    displayRank,
+    reviewRank,
+    credibilityRank,
+    sourceRank,
+    officialRank,
+    -Number(item.data_quality?.score || 0),
+    -opportunityYieldValue(item),
+    -(Number.isFinite(timestamp) ? timestamp : 0)
+  ];
+}
+
+function compareDuplicateRepresentative(a, b) {
+  const left = duplicateRepresentativeRank(a);
+  const right = duplicateRepresentativeRank(b);
+  for (let index = 0; index < left.length; index += 1) {
+    const diff = left[index] - right[index];
+    if (diff) return diff;
+  }
+  return String(a.activity_name || "").localeCompare(String(b.activity_name || ""));
+}
+
+function uniqueCompact(values, limit = 8) {
+  return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))].slice(0, limit);
+}
+
+function buildDuplicateAnalysis(representative = {}, dedupKey = null) {
+  const family = inferCampaignFamily(representative);
+  const { subject, basis } = campaignDedupeSubject(representative, family);
+  return {
+    platform: canonicalOpportunityPlatform(representative),
+    family,
+    subject,
+    match_basis: basis,
+    event_type: representative.campaign_profile?.event_type || inferCampaignEventType(representative),
+    dedup_scope: dedupKey ? "platform_family_subject" : "single_source"
+  };
+}
+
+function buildDuplicateProfile(group, dedupKey) {
+  const apyValues = uniqueCompact(
+    group
+      .map((item) => opportunityYieldValue(item))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .map((value) => Number(value.toFixed(4)))
+  ).map(Number);
+  const minApy = apyValues.length ? Math.min(...apyValues) : null;
+  const maxApy = apyValues.length ? Math.max(...apyValues) : null;
+  const apyRangeLabel =
+    Number.isFinite(minApy) && Number.isFinite(maxApy)
+      ? minApy === maxApy
+        ? `${maxApy}% APY`
+        : `${minApy}-${maxApy}% APY`
+      : "";
+  return {
+    dedup_key: dedupKey,
+    source_count: group.length,
+    merged_count: Math.max(0, group.length - 1),
+    source_users: uniqueCompact(group.map((item) => item.source_user), 10),
+    source_urls: uniqueCompact(group.map((item) => item.source_url), 10),
+    activity_names: uniqueCompact(group.map((item) => item.activity_name), 10),
+    apy_values: apyValues,
+    apy_range_label: apyRangeLabel,
+    analysis: buildDuplicateAnalysis(group[0], dedupKey)
+  };
+}
+
+function activeDuplicateYieldValue(group) {
+  const values = group
+    .filter((item) => item.status === "active" && item.display_category !== "watch_opportunity")
+    .map(opportunityYieldValue)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return values.length ? Math.max(...values) : null;
+}
+
+function applyDuplicateYieldProfile(representative, group, profile) {
+  const activeMaxApy = activeDuplicateYieldValue(group);
+  const representativeApy = opportunityYieldValue(representative);
+  if (!Number.isFinite(activeMaxApy) || activeMaxApy <= representativeApy) {
+    return {
+      ...representative,
+      duplicate_profile: profile
+    };
+  }
+  const asset = campaignAssetSymbol(representative) || representative.stablecoin || representative.asset || "资产";
+  const qualifiers = [...new Set([...(representative.yield_profile?.qualifiers || []), "多来源最高"])];
+  return {
+    ...representative,
+    display_reason:
+      representative.display_category === "stablecoin_yield"
+        ? `${asset} APY ${activeMaxApy}%`
+        : representative.display_reason,
+    yield_profile: {
+      ...(representative.yield_profile || {}),
+      max_apy: activeMaxApy,
+      eligible_apy: activeMaxApy,
+      max_apy_source: "merged_active_sources",
+      qualifiers,
+      summary: `${representative.yield_profile?.label || "收益"}：${qualifiers.join("、")}`
+    },
+    duplicate_profile: {
+      ...profile,
+      active_max_apy: activeMaxApy
+    }
+  };
+}
+
+function mergeDuplicateOpportunities(items) {
+  const groups = new Map();
+  const unique = [];
+  for (const item of items) {
+    const key = opportunityDedupKey(item);
+    if (!key) {
+      unique.push({
+        ...item,
+        duplicate_profile: buildDuplicateProfile([item], null)
+      });
+      continue;
+    }
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+
+  const duplicateExamples = [];
+  for (const [key, group] of groups.entries()) {
+    if (group.length === 1) {
+      unique.push({
+        ...group[0],
+        duplicate_profile: buildDuplicateProfile(group, key)
+      });
+      continue;
+    }
+    const representative = [...group].sort(compareDuplicateRepresentative)[0];
+    const profile = buildDuplicateProfile(group, key);
+    duplicateExamples.push({
+      activity_name: representative.activity_name,
+      exchange: representative.exchange || representative.venue || "",
+      asset: campaignAssetSymbol(representative),
+      family: profile.analysis.family,
+      match_basis: profile.analysis.match_basis,
+      source_count: profile.source_count,
+      source_users: profile.source_users,
+      apy_range_label: profile.apy_range_label
+    });
+    unique.push(applyDuplicateYieldProfile(representative, group, profile));
+  }
+
+  return {
+    items: unique,
+    duplicate_group_count: [...groups.values()].filter((group) => group.length > 1).length,
+    duplicate_item_count: [...groups.values()].reduce((sum, group) => sum + Math.max(0, group.length - 1), 0),
+    duplicate_examples: duplicateExamples.slice(0, 12)
+  };
+}
+
+function evaluateOpportunityDisplay(item) {
+  if (item.yield_profile?.new_user_only) {
+    return { ok: false, exclude: true, reason: "新户限定，已按非新用户过滤" };
+  }
+
+  if (item.status !== "active") {
+    return { ok: false, reason: "非 active 状态" };
+  }
+
+  const text = displayTextForOpportunity(item);
+  const excludedPattern = EXCLUDED_OPPORTUNITY_PATTERNS.find((pattern) => pattern.test(text));
+  if (excludedPattern) {
+    return { ok: false, reason: "排除邀请、交易量竞赛、排名、抽奖或纯任务活动" };
+  }
+
+  const stablecoin = String(item.stablecoin || item.asset || "").toUpperCase();
+  const maxApy = maxOpportunityApy(item);
+  if (DISPLAY_STABLECOINS.has(stablecoin) && Number.isFinite(maxApy) && maxApy > 10) {
+    return {
+      ok: true,
+      category: "stablecoin_yield",
+      reason: `${stablecoin} APY ${maxApy}%`
+    };
+  }
+
+  if (!isQuickOpportunityType(item, text)) {
+    return { ok: false, reason: "不属于稳定币高息或 IPO/IEO/ICO/Launch 短期机会" };
+  }
+
+  if (hasDayScaleDuration(text)) {
+    if (Number.isFinite(maxApy) && maxApy > 10) {
+      return {
+        ok: true,
+        category: "quick_opportunity",
+        reason: `按天机会，年化 ${maxApy}%`
+      };
+    }
+    return { ok: false, reason: "按天完成但缺少大于 10% 的可计算年化" };
+  }
+
+  const rewardUsd = parseUsdReward(text);
+  const timeCostMinutes = parseTimeCostMinutes(text);
+  if (!Number.isFinite(rewardUsd) || !Number.isFinite(timeCostMinutes)) {
+    return { ok: false, reason: "缺少个人可得收益或时间成本" };
+  }
+  if (timeCostMinutes <= 10 && rewardUsd >= 10) {
+    return {
+      ok: true,
+      category: "quick_opportunity",
+      reason: `预计 ${Math.round(timeCostMinutes)} 分钟，个人收益约 ${rewardUsd}U`
+    };
+  }
+  if (timeCostMinutes <= 120 && rewardUsd >= 50) {
+    return {
+      ok: true,
+      category: "quick_opportunity",
+      reason: `预计 ${Math.round(timeCostMinutes)} 分钟，个人收益约 ${rewardUsd}U`
+    };
+  }
+  return { ok: false, reason: "短期收益未达到时间成本门槛" };
+}
+
+function applyOpportunityDisplayFilter(items) {
+  const kept = [];
+  const watch = [];
+  const excluded = [];
+  for (const item of items) {
+    const evaluation = evaluateOpportunityDisplay(item);
+    if (evaluation.exclude) {
+      excluded.push({
+        activity_name: item.activity_name,
+        type: item.type,
+        section: item.section,
+        exchange: item.exchange || "",
+        venue: item.venue || "",
+        reason: evaluation.reason
+      });
+      continue;
+    }
+    if (evaluation.ok) {
+      kept.push({
+        ...item,
+        display_category: evaluation.category,
+        display_reason: evaluation.reason
+      });
+    } else {
+      watch.push({
+        activity_name: item.activity_name,
+        type: item.type,
+        section: item.section,
+        exchange: item.exchange || "",
+        venue: item.venue || "",
+        reason: evaluation.reason
+      });
+      kept.push({
+        ...item,
+        review:
+          item.review?.label === "可参与"
+            ? {
+                ...item.review,
+                label: "观察项",
+                tone: "info",
+                reason: evaluation.reason
+              }
+            : item.review,
+        display_category: "watch_opportunity",
+        display_reason: evaluation.reason
+      });
+    }
+  }
+  const deduped = mergeDuplicateOpportunities(kept);
+  const dedupedWatch = deduped.items.filter((item) => item.display_category === "watch_opportunity");
+  return {
+    items: deduped.items,
+    summary: {
+      input_count: items.length,
+      kept_count: deduped.items.length,
+      pre_dedup_kept_count: kept.length,
+      excluded_count: excluded.length,
+      excluded_new_user_count: excluded.filter((item) => item.reason.includes("新户限定")).length,
+      watch_count: dedupedWatch.length,
+      stablecoin_yield_count: deduped.items.filter((item) => item.display_category === "stablecoin_yield").length,
+      quick_opportunity_count: deduped.items.filter((item) => item.display_category === "quick_opportunity").length,
+      duplicate_group_count: deduped.duplicate_group_count,
+      duplicate_item_count: deduped.duplicate_item_count,
+      excluded_examples: excluded.slice(0, 12),
+      watch_examples: watch.slice(0, 12),
+      duplicate_examples: deduped.duplicate_examples
+    }
+  };
+}
+
 function buildStablecoinSummary(items) {
-  const rows = items.filter((item) => item.type === "stablecoin_earn" && item.status !== "unverified");
+  const rows = items.filter((item) => item.display_category === "stablecoin_yield" && item.status !== "unverified");
   const byCoin = {};
   const bySection = { cex: 0, onchain: 0 };
   let highest = null;
@@ -94,9 +888,7 @@ function buildStablecoinSummary(items) {
     byCoin[coin] = (byCoin[coin] || 0) + 1;
     const section = item.section === "onchain" ? "onchain" : "cex";
     bySection[section] = (bySection[section] || 0) + 1;
-    const apy = Number.isFinite(Number(item.yield_profile?.max_apy))
-      ? Number(item.yield_profile.max_apy)
-      : Number(item.apy || 0);
+    const apy = opportunityYieldValue(item);
     if (!highest || apy > Number(highest.apy || 0)) {
       const baseApy = Number.isFinite(Number(item.apy)) ? Number(item.apy) : null;
       const isPromotionalHigh = Number.isFinite(apy) && Number.isFinite(baseApy) && apy > baseApy;
@@ -138,7 +930,7 @@ function opportunityGapPriority(item) {
   let score = 0;
   if (item.status === "active") score += 30;
   if (item.type === "stablecoin_earn") score += 25;
-  if (item.type === "pre_ipo") score += 20;
+  if (item.type === "pre_ipo" || item.type === "pre_tge") score += 20;
   if (item.type === "launch") score += 15;
   if (item.section === "cex") score += 10;
   if (item.source_url) score += 5;
@@ -939,6 +1731,10 @@ function buildOpportunityRisk(row) {
     score = Math.max(score, 4);
     reasons.push("Pre-IPO/估值与流动性风险");
   }
+  if (row.type === "pre_tge") {
+    score = Math.max(score, 4);
+    reasons.push("Pre-TGE/资格与代币兑现风险");
+  }
   if (row.section === "onchain") {
     score = Math.max(score, 4);
     reasons.push("链上合约/流动性风险");
@@ -994,7 +1790,10 @@ function buildOpportunityYieldProfile(row = {}) {
   const qualifiers = [];
   let tone = "apy";
   let label = row.type === "stablecoin_earn" ? "理财收益" : "奖励收益";
-  const baseApy = Number.isFinite(Number(row.apy)) ? Number(row.apy) : null;
+  const newUserOnly = isNewUserOnlyOpportunity(row);
+  const hasNewUserTier = hasNewUserTerm(text);
+  const hasCurrentUserTier = hasCurrentUserTerm(text);
+  const baseApy = !newUserOnly && Number.isFinite(Number(row.apy)) ? Number(row.apy) : null;
   const parsedApy = parseMaxApyPercent(row);
   const maxApy = Number.isFinite(parsedApy) ? parsedApy : baseApy;
   const maxApySource = Number.isFinite(parsedApy) && parsedApy !== baseApy ? "text" : "stored";
@@ -1009,9 +1808,12 @@ function buildOpportunityYieldProfile(row = {}) {
     tone = "risk";
     label = "结构化收益";
   }
-  if (/new user|new users|新户|新用户/.test(text)) {
+  if (newUserOnly) {
     qualifiers.push("新户限定");
     tone = tone === "risk" ? tone : "warn";
+  } else if (hasNewUserTier && hasCurrentUserTier) {
+    qualifiers.push("含新户档");
+    tone = tone === "risk" ? tone : "info";
   }
   if (/boost|boosted|bonus|promotion|promotional|limited-time|campaign|加成|促销|限时/.test(text)) {
     qualifiers.push("促销加成");
@@ -1029,7 +1831,8 @@ function buildOpportunityYieldProfile(row = {}) {
     qualifiers.push("浮动利率");
     tone = tone === "risk" ? tone : "info";
   }
-  if (/fixed|定期|固定/.test(text) && !qualifiers.includes("浮动利率")) {
+  const hasFixedTerm = /fixed|定期|固定/.test(text) && !/no fixed|无固定|非固定|不固定|活期|flexible|no lock|无锁/.test(text);
+  if (hasFixedTerm && !qualifiers.includes("浮动利率")) {
     qualifiers.push("固定期限");
   }
   if (row.section === "onchain") {
@@ -1040,6 +1843,11 @@ function buildOpportunityYieldProfile(row = {}) {
   if (row.type === "pre_ipo") {
     qualifiers.push("非 APY 收益");
     label = "Pre-IPO 敞口";
+    tone = "risk";
+  }
+  if (row.type === "pre_tge") {
+    qualifiers.push("非 APY 收益");
+    label = "Pre-TGE 资格/份额";
     tone = "risk";
   }
   if (row.type === "launch") {
@@ -1054,7 +1862,9 @@ function buildOpportunityYieldProfile(row = {}) {
     tone,
     base_apy: baseApy,
     max_apy: Number.isFinite(maxApy) ? maxApy : null,
+    eligible_apy: Number.isFinite(maxApy) ? maxApy : null,
     max_apy_source: maxApySource,
+    new_user_only: newUserOnly,
     qualifiers: uniqueQualifiers,
     summary: uniqueQualifiers.length ? `${label}：${uniqueQualifiers.join("、")}` : label
   };
@@ -1092,6 +1902,13 @@ function buildOpportunityParticipationGuidance(row = {}) {
       `确认是否用 ${asset} 认购、最低金额、配额和发放/交易时间`,
       "核验锁定、转让、流动性、估值和地区限制后再参与"
     ];
+  } else if (row.type === "pre_tge") {
+    text = `进入 ${venue} 官方 Pre-TGE 活动入口，按公告完成白名单、积分、快照、预存款或社区销售要求，先核验 TGE 时间、资格与代币解锁规则。`;
+    steps = [
+      `打开 ${venue} 官方 Pre-TGE 或公告入口`,
+      "确认白名单、积分、快照、预存款或销售资格要求",
+      "核验 TGE、代币发放、解锁、女巫过滤和地区限制"
+    ];
   } else if (row.type === "launch") {
     text = `进入 ${venue} Launchpad/Launchpool/Startup 或任务页，按公告完成报名、质押、交易或任务，确认奖励发放时间。`;
     steps = [
@@ -1120,16 +1937,21 @@ function buildOpportunityParticipationGuidance(row = {}) {
 }
 
 function attachOpportunityQuality(rows, now = new Date()) {
-  return rows.map((row) => ({
-    ...row,
-    data_quality: buildOpportunityQuality(row),
-    review: buildOpportunityReview(row),
-    urgency: buildOpportunityUrgency(row, now),
-    freshness: buildOpportunityFreshness(row, now),
-    risk_profile: buildOpportunityRisk(row),
-    yield_profile: buildOpportunityYieldProfile(row),
-    participation_guidance: buildOpportunityParticipationGuidance(row)
-  }));
+  return rows.map((row) => {
+    const urgency = buildOpportunityUrgency(row, now);
+    const yieldProfile = buildOpportunityYieldProfile(row);
+    return {
+      ...row,
+      data_quality: buildOpportunityQuality(row),
+      review: buildOpportunityReview(row),
+      urgency,
+      freshness: buildOpportunityFreshness(row, now),
+      risk_profile: buildOpportunityRisk(row),
+      yield_profile: yieldProfile,
+      campaign_profile: buildOpportunityCampaignProfile(row, yieldProfile, urgency),
+      participation_guidance: buildOpportunityParticipationGuidance(row)
+    };
+  });
 }
 
 function compareOpportunityDisplay(a, b) {
@@ -1143,14 +1965,16 @@ function compareOpportunityDisplay(a, b) {
     ({ urgent: 0, soon: 1, normal: 2, pending: 3, watch: 4, expired: 5 })[item.urgency?.level] ?? 6;
   const freshnessRank = (item) =>
     ({ new: 0, recent_24: 1, recent_72: 2, stale_96: 3, stale: 4, unknown: 5 })[item.freshness?.level] ?? 6;
+  const displayRank = (item) => ({ stablecoin_yield: 0, quick_opportunity: 1, watch_opportunity: 2 })[item.display_category] ?? 3;
   const typeRank = (item) =>
-    ({ stablecoin_earn: 0, pre_ipo: 1, launch: 2, short_term: 3, onchain: 4 })[item.type] ?? 5;
+    ({ pre_tge: 0, launch: 1, stablecoin_earn: 2, pre_ipo: 3, short_term: 4, onchain: 5 })[item.type] ?? 6;
   return (
+    displayRank(a) - displayRank(b) ||
+    opportunityYieldValue(b) - opportunityYieldValue(a) ||
     reviewRank(a) - reviewRank(b) ||
     urgencyRank(a) - urgencyRank(b) ||
     freshnessRank(a) - freshnessRank(b) ||
     typeRank(a) - typeRank(b) ||
-    Number(b.apy || 0) - Number(a.apy || 0) ||
     String(b.last_seen_at || "").localeCompare(String(a.last_seen_at || ""))
   );
 }
@@ -1160,7 +1984,61 @@ function getDisplayOpportunityItems(db, config) {
     db.getDisplayOpportunities?.(config.opportunityStaleAfterHours) ||
     db.getActiveOpportunities?.(config.opportunityStaleAfterHours) ||
     [];
-  return attachOpportunityQuality(rawItems, new Date()).sort(compareOpportunityDisplay);
+  const enriched = attachOpportunityQuality(rawItems, new Date());
+  return applyOpportunityDisplayFilter(enriched).items.sort(compareOpportunityDisplay);
+}
+
+function getDisplayOpportunityPayload(db, config) {
+  const rawItems =
+    db.getDisplayOpportunities?.(config.opportunityStaleAfterHours) ||
+    db.getActiveOpportunities?.(config.opportunityStaleAfterHours) ||
+    [];
+  const enriched = attachOpportunityQuality(rawItems, new Date());
+  const payload = applyOpportunityDisplayFilter(enriched);
+  payload.items.sort(compareOpportunityDisplay);
+  return payload;
+}
+
+function parseSecuritySkipReasons(detail = "") {
+  const matched = String(detail || "").match(/skip_reasons=(\{.*?\})(?:\s|$)/);
+  if (!matched) return {};
+  try {
+    return JSON.parse(matched[1]);
+  } catch {
+    return {};
+  }
+}
+
+function buildSecurityIncidentPayload(db, getSecurityIncidentStatus) {
+  const monitor = getSecurityIncidentStatus?.() || { enabled: false, running: false };
+  const items = db.getSecurityIncidents?.(20) || [];
+  const summary =
+    db.getSecurityIncidentSummary?.() || {
+      total: items.length,
+      critical: items.filter((item) => item.alert_level === "critical").length,
+      anomaly: items.filter((item) => item.alert_level === "anomaly").length,
+      watch: items.filter((item) => item.alert_level === "watch").length,
+      pushed: items.filter((item) => item.anomaly_pushed_at || item.critical_pushed_at).length
+    };
+  const health = db.getRecentHealth?.("security_incident_monitor", 10) || [];
+  const skipReasons = health.reduce((acc, row) => {
+    const reasons = parseSecuritySkipReasons(row.detail);
+    for (const [key, count] of Object.entries(reasons)) {
+      acc[key] = (acc[key] || 0) + Number(count || 0);
+    }
+    return acc;
+  }, {});
+
+  return {
+    ok: true,
+    generated_at: new Date().toISOString(),
+    monitor,
+    summary,
+    latest_health: health[0] || null,
+    recent_health: health,
+    skip_reasons: skipReasons,
+    items
+  };
 }
 
 function buildOpportunitiesPage() {
@@ -1169,49 +2047,79 @@ function buildOpportunitiesPage() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>xintel 高收益机会监控</title>
+  <title>高收益机会看板</title>
   <style>
     :root {
-      color-scheme: light;
-      --bg: #f6f7f8;
-      --panel: #ffffff;
-      --text: #17201b;
-      --muted: #65716b;
-      --line: #dfe5e1;
-      --accent: #087f5b;
-      --accent-soft: #dff4ea;
-      --warn: #9a6700;
-      --warn-soft: #fff1c2;
-      --risk: #b42318;
-      --risk-soft: #ffe4df;
-      --info: #255a9b;
-      --info-soft: #dbeafe;
+      color-scheme: dark;
+      --bg: #050509;
+      --panel: #0c0c12;
+      --panel-strong: #12121b;
+      --text: #f7f1ff;
+      --muted: #a99bb8;
+      --line: #2d2135;
+      --line-hot: #ff2f92;
+      --accent: #ff2f92;
+      --accent-soft: rgba(255, 47, 146, 0.16);
+      --warn: #ffd166;
+      --warn-soft: rgba(255, 209, 102, 0.15);
+      --risk: #ff4d6d;
+      --risk-soft: rgba(255, 77, 109, 0.16);
+      --info: #72f7ff;
+      --info-soft: rgba(114, 247, 255, 0.14);
+      --ink: #ffffff;
+      --shadow-hot: 0 0 0 1px rgba(255, 47, 146, 0.22), 0 18px 42px rgba(0, 0, 0, 0.34);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      background: var(--bg);
+      background:
+        linear-gradient(rgba(255, 47, 146, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(114, 247, 255, 0.025) 1px, transparent 1px),
+        var(--bg);
+      background-size: 28px 28px;
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 14px;
       letter-spacing: 0;
     }
     header {
-      padding: 18px 22px 12px;
+      padding: 22px 22px 18px;
       border-bottom: 1px solid var(--line);
-      background: var(--panel);
+      background: rgba(5, 5, 9, 0.96);
+      box-shadow: 0 1px 0 rgba(255, 47, 146, 0.16);
+    }
+    .hero {
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+    .hero-top {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: start;
+      margin-bottom: 16px;
     }
     h1 {
-      margin: 0 0 12px;
-      font-size: 22px;
+      margin: 0 0 8px;
+      font-size: 28px;
       line-height: 1.2;
       font-weight: 700;
+      color: var(--ink);
+      text-shadow: 0 0 18px rgba(255, 47, 146, 0.55);
+    }
+    .subtitle {
+      margin: 0;
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
     }
     .actions {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      margin: -4px 0 12px;
+      margin: 0;
+      justify-content: flex-end;
     }
     .action-link {
       display: inline-flex;
@@ -1220,23 +2128,33 @@ function buildOpportunitiesPage() {
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 6px 9px;
-      background: #fbfcfb;
-      color: var(--info);
+      background: #101019;
+      color: var(--accent);
       font-size: 13px;
       font-weight: 700;
+      box-shadow: inset 0 0 0 1px rgba(255, 47, 146, 0.08);
+    }
+    .action-link:hover {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      text-decoration: none;
     }
     .status {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      grid-template-columns: repeat(4, minmax(150px, 1fr));
       gap: 10px;
       max-width: 1180px;
+    }
+    .ops-panel .status {
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     }
     .metric {
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: #fbfcfb;
+      background: linear-gradient(180deg, #12121b 0%, #0b0b11 100%);
       padding: 10px 12px;
       min-width: 0;
+      box-shadow: inset 0 0 0 1px rgba(255, 47, 146, 0.06);
     }
     .metric span {
       display: block;
@@ -1248,9 +2166,116 @@ function buildOpportunitiesPage() {
       display: block;
       overflow-wrap: anywhere;
       font-size: 14px;
+      color: var(--accent);
     }
     main {
       padding: 14px 22px 28px;
+      max-width: 1224px;
+      margin: 0 auto;
+    }
+    .section-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      margin: 12px 0 10px;
+    }
+    .section-head h2 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.25;
+    }
+    .section-head p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .opportunity-list {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .opportunity-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 14px;
+      min-width: 0;
+      box-shadow: var(--shadow-hot);
+    }
+    .opportunity-card h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+      line-height: 1.35;
+    }
+    .opportunity-row {
+      display: grid;
+      grid-template-columns: minmax(220px, 1.2fr) minmax(180px, 0.75fr) minmax(240px, 1fr) minmax(220px, 0.9fr);
+      gap: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: linear-gradient(180deg, rgba(18, 18, 27, 0.98), rgba(9, 9, 14, 0.98));
+      padding: 14px;
+      min-width: 0;
+      box-shadow: var(--shadow-hot);
+    }
+    .opportunity-row:hover {
+      border-color: rgba(255, 47, 146, 0.62);
+      box-shadow: 0 0 0 1px rgba(255, 47, 146, 0.42), 0 0 30px rgba(255, 47, 146, 0.14);
+    }
+    .row-title h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+      line-height: 1.35;
+      color: var(--ink);
+    }
+    .row-block {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    .row-label {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .card-meta,
+    .card-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin: 7px 0;
+    }
+    .card-text {
+      margin: 8px 0 0;
+      color: var(--text);
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .card-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .source-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 10px;
+      font-size: 13px;
+    }
+    .ops-panel {
+      margin-top: 18px;
+      border-top: 1px solid var(--line);
+      padding-top: 14px;
+    }
+    details.ops-panel summary {
+      cursor: pointer;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 12px;
     }
     .tabs {
       display: flex;
@@ -1258,6 +2283,43 @@ function buildOpportunitiesPage() {
       overflow-x: auto;
       padding-bottom: 10px;
       margin-bottom: 4px;
+    }
+    .filter-bar {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(160px, 1fr));
+      gap: 10px;
+      align-items: end;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(12, 12, 18, 0.96);
+      padding: 10px;
+      margin: 0 0 12px;
+      box-shadow: inset 0 0 0 1px rgba(114, 247, 255, 0.05);
+    }
+    .filter-control {
+      min-width: 0;
+    }
+    .filter-control label {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .filter-control select {
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #090910;
+      color: var(--text);
+      padding: 6px 9px;
+      font: inherit;
+      outline: none;
+    }
+    .filter-control select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(255, 47, 146, 0.16);
     }
     .coverage {
       margin-bottom: 12px;
@@ -1307,7 +2369,7 @@ function buildOpportunitiesPage() {
     .gap-item {
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: var(--panel);
+      background: var(--panel-strong);
       padding: 9px 10px;
       min-width: 0;
     }
@@ -1325,7 +2387,7 @@ function buildOpportunitiesPage() {
     .tab {
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: var(--panel);
+      background: #0c0c12;
       color: var(--text);
       padding: 8px 10px;
       min-height: 34px;
@@ -1335,14 +2397,14 @@ function buildOpportunitiesPage() {
     .tab.active {
       border-color: var(--accent);
       background: var(--accent-soft);
-      color: #07563f;
+      color: var(--ink);
       font-weight: 700;
+      box-shadow: 0 0 16px rgba(255, 47, 146, 0.18);
     }
     .table-wrap {
-      overflow-x: auto;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
+      overflow: visible;
+      border: 0;
+      background: transparent;
     }
     table {
       width: 100%;
@@ -1360,7 +2422,7 @@ function buildOpportunitiesPage() {
       color: var(--muted);
       font-size: 12px;
       font-weight: 700;
-      background: #fbfcfb;
+      background: #11111a;
     }
     tr:last-child td { border-bottom: 0; }
     a { color: var(--info); text-decoration: none; }
@@ -1377,13 +2439,15 @@ function buildOpportunitiesPage() {
       font-size: 12px;
       line-height: 1.2;
       overflow-wrap: anywhere;
-      background: #eef2f0;
-      color: #34423b;
+      background: #161622;
+      color: #d8cee5;
+      border: 1px solid rgba(255, 255, 255, 0.06);
     }
-    .tag.apy { background: var(--accent-soft); color: #07563f; font-weight: 700; }
+    .tag.apy { background: var(--accent-soft); color: #ff8cc6; border-color: rgba(255, 47, 146, 0.38); font-weight: 700; }
     .tag.warn { background: var(--warn-soft); color: var(--warn); }
     .tag.risk { background: var(--risk-soft); color: var(--risk); }
     .tag.info { background: var(--info-soft); color: var(--info); }
+    .tag.hot { background: rgba(255, 47, 146, 0.22); color: #ffc1df; border-color: rgba(255, 47, 146, 0.48); }
     .empty {
       padding: 26px;
       color: var(--muted);
@@ -1393,68 +2457,99 @@ function buildOpportunitiesPage() {
     }
     @media (max-width: 760px) {
       header, main { padding-left: 12px; padding-right: 12px; }
+      .hero-top { grid-template-columns: 1fr; }
+      .actions { justify-content: flex-start; }
       .status { grid-template-columns: 1fr 1fr; }
-      h1 { font-size: 20px; }
+      .filter-bar { grid-template-columns: 1fr 1fr; }
+      h1 { font-size: 24px; }
+      .opportunity-row { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 520px) {
+      .filter-bar { grid-template-columns: 1fr; }
+      .status { grid-template-columns: 1fr; }
+      .actions { width: 100%; }
+      .action-link { flex: 1; justify-content: center; }
+      .section-head { align-items: start; }
+      .opportunity-row { padding: 12px; gap: 10px; }
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>xintel 高收益机会监控</h1>
-    <div class="actions">
-      <a class="action-link" href="/api/opportunities/export.csv">导出 CSV</a>
-      <a class="action-link" href="/api/opportunities" target="_blank" rel="noreferrer">查看 JSON API</a>
+    <div class="hero">
+      <div class="hero-top">
+        <div>
+          <h1>高收益机会看板</h1>
+          <p class="subtitle">按当前用户可参与 APY 从高到低排序；新户专属活动默认过滤，含新户档的活动只按老用户/普通用户收益展示。</p>
+        </div>
+        <div class="actions">
+          <a class="action-link" href="/api/opportunities/export.csv">导出 CSV</a>
+          <a class="action-link" href="/api/opportunities" target="_blank" rel="noreferrer">JSON API</a>
+        </div>
+      </div>
+      <section class="status">
+        <div class="metric"><span>当前机会</span><strong id="totalCount">0</strong></div>
+        <div class="metric"><span>稳定币最高</span><strong id="stablecoinTop">加载中</strong></div>
+        <div class="metric"><span>短期机会</span><strong id="shortTermCount">加载中</strong></div>
+        <div class="metric"><span>最近更新</span><strong id="lastRun">加载中</strong></div>
+      </section>
     </div>
-    <section class="status">
-      <div class="metric"><span>最近采集</span><strong id="lastRun">加载中</strong></div>
-      <div class="metric"><span>下次采集</span><strong id="nextRun">加载中</strong></div>
-      <div class="metric"><span>采集状态</span><strong id="runStatus">加载中</strong></div>
-      <div class="metric"><span>展示机会</span><strong id="totalCount">0</strong></div>
-      <div class="metric"><span>CEX覆盖</span><strong id="coverageQuality">加载中</strong></div>
-      <div class="metric"><span>下轮查询</span><strong id="queryPlanSummary">加载中</strong></div>
-      <div class="metric"><span>稳定币最高</span><strong id="stablecoinTop">加载中</strong></div>
-      <div class="metric"><span>新鲜度</span><strong id="freshnessQuality">加载中</strong></div>
-      <div class="metric"><span>可参与</span><strong id="actionableCount">加载中</strong></div>
-      <div class="metric"><span>截止质量</span><strong id="deadlineQuality">加载中</strong></div>
-      <div class="metric"><span>官方链接</span><strong id="officialQuality">加载中</strong></div>
-      <div class="metric"><span>资料完整度</span><strong id="dataQuality">加载中</strong></div>
-      <div class="metric"><span>待补字段</span><strong id="fieldGapQuality">加载中</strong></div>
-      <div class="metric"><span>补查队列</span><strong id="enrichmentBacklogMetric">加载中</strong></div>
-      <div class="metric"><span>采集诊断</span><strong id="diagnosticStatus">加载中</strong></div>
-      <div class="metric"><span>任务明细</span><strong id="jobStatsSummary">加载中</strong></div>
-      <div class="metric"><span>观察项</span><strong id="watchCount">加载中</strong></div>
-      <div class="metric"><span>即将截止</span><strong id="urgentCount">加载中</strong></div>
-      <div class="metric"><span>高风险</span><strong id="highRiskCount">加载中</strong></div>
-    </section>
   </header>
   <main>
-    <section id="coverage" class="coverage"></section>
-    <section id="queryPlan" class="coverage"></section>
-    <section id="stablecoinSummary" class="coverage"></section>
-    <section id="runHistory" class="coverage"></section>
-    <section id="jobStats" class="coverage"></section>
-    <section id="diagnostics" class="coverage"></section>
-    <section id="fieldGaps" class="coverage"></section>
-    <section id="enrichmentBacklog" class="coverage"></section>
     <nav class="tabs" id="tabs" data-default-excludes-unverified="true"></nav>
+    <section class="filter-bar" id="filterBar" aria-label="活动筛选"></section>
     <section id="content" class="table-wrap"></section>
+    <details class="ops-panel">
+      <summary>采集状态与数据质量</summary>
+      <section class="status">
+        <div class="metric"><span>下次采集</span><strong id="nextRun">加载中</strong></div>
+        <div class="metric"><span>采集状态</span><strong id="runStatus">加载中</strong></div>
+        <div class="metric"><span>CEX覆盖</span><strong id="coverageQuality">加载中</strong></div>
+        <div class="metric"><span>下轮查询</span><strong id="queryPlanSummary">加载中</strong></div>
+        <div class="metric"><span>新鲜度</span><strong id="freshnessQuality">加载中</strong></div>
+        <div class="metric"><span>截止质量</span><strong id="deadlineQuality">加载中</strong></div>
+        <div class="metric"><span>官方链接</span><strong id="officialQuality">加载中</strong></div>
+        <div class="metric"><span>资料完整度</span><strong id="dataQuality">加载中</strong></div>
+        <div class="metric"><span>待补字段</span><strong id="fieldGapQuality">加载中</strong></div>
+        <div class="metric"><span>补查队列</span><strong id="enrichmentBacklogMetric">加载中</strong></div>
+        <div class="metric"><span>采集诊断</span><strong id="diagnosticStatus">加载中</strong></div>
+        <div class="metric"><span>安全事件</span><strong id="securityIncidentMetric">加载中</strong></div>
+        <div class="metric"><span>任务明细</span><strong id="jobStatsSummary">加载中</strong></div>
+        <div class="metric"><span>观察项</span><strong id="watchCount">加载中</strong></div>
+        <div class="metric"><span>高风险</span><strong id="highRiskCount">加载中</strong></div>
+      </section>
+      <section id="stablecoinSummary" class="coverage"></section>
+      <section id="coverage" class="coverage"></section>
+      <section id="queryPlan" class="coverage"></section>
+      <section id="runHistory" class="coverage"></section>
+      <section id="jobStats" class="coverage"></section>
+      <section id="diagnostics" class="coverage"></section>
+      <section id="securityIncidents" class="coverage"></section>
+      <section id="fieldGaps" class="coverage"></section>
+      <section id="enrichmentBacklog" class="coverage"></section>
+    </details>
   </main>
   <script>
     const tabDefs = [
       ["all", "全部"],
-      ["new", "新发现"],
-      ["urgent", "即将截止"],
-      ["watch", "观察项"],
-      ["high_risk", "高风险"],
-      ["unverified", "待核验"],
-      ["stablecoin_earn", "稳定币理财"],
-      ["launch", "打新"],
-      ["pre_ipo", "Pre-IPO"],
-      ["short_term", "短期活动"],
-      ["onchain", "链上/DEX"]
+      ["stablecoin_yield", "稳定币高息"],
+      ["quick_opportunity", "短期机会"],
+      ["watch_opportunity", "观察项"],
+      ["cex", "CEX"],
+      ["onchain", "链上/DEX"],
+      ["urgent", "即将截止"]
     ];
+    const displayCategoryLabels = {
+      stablecoin_yield: "稳定币高息",
+      quick_opportunity: "短期机会",
+      watch_opportunity: "观察项"
+    };
     let state = {
       activeTab: "all",
+      exchangeFilter: "all",
+      quotaFilter: "all",
+      lockFilter: "all",
+      sortMode: "apy",
       items: [],
       coverage: null,
       queryPlan: null,
@@ -1463,9 +2558,11 @@ function buildOpportunitiesPage() {
       fieldGaps: null,
       enrichmentBacklog: null,
       diagnostics: null,
+      securityIncidents: null,
       latestRun: null,
       runHealth: null,
-      monitor: null
+      monitor: null,
+      displayFilter: null
     };
 
     function fmtTime(value) {
@@ -1507,6 +2604,7 @@ function buildOpportunitiesPage() {
       return {
         stablecoin_earn: "稳定币理财",
         launch: "打新",
+        pre_tge: "Pre-TGE",
         pre_ipo: "Pre-IPO",
         short_term: "短期临时",
         onchain: "链上/DEX"
@@ -1571,6 +2669,12 @@ function buildOpportunitiesPage() {
         [/EU users only; subscribe Bybit EU Fixed\\/Easy Earn USDC 通过 bybit\\.eu earn pages/gi, "仅限欧盟用户；通过 bybit.eu Earn 页面认购 Bybit EU USDC Fixed/Easy Earn"],
         [/Subscribe USD1 Flexible Products, max 2,000 USD1 limit per tier/gi, "认购 USD1 灵活理财，每档最高 2,000 USD1"],
         [/Subscribe USD1 灵活 Products, max 2,000 USD1 limit per tier/gi, "认购 USD1 灵活理财，每档最高 2,000 USD1"],
+        [/USD1 Simple Earn 灵活/gi, "USD1 简单赚币灵活理财"],
+        [/Binance App 或网页 -> Earn -> Simple Earn -> 搜索 USD1 -> 选择 灵活 产品认购/gi, "打开 Binance App 或网页，进入 Earn / Simple Earn，搜索 USD1，选择灵活理财产品认购"],
+        [/New users: deposit \\$10 \\+ trade \\$10 spot \\(get 5 USDT\\); all users: trade SPCXUSDT Perps min 1,000 USDT vol to share 150,000 USDT pool/gi, "新用户充值 10 美元并完成 10 美元现货交易可得 5 USDT；所有用户交易 SPCXUSDT 永续，成交量至少 1,000 USDT 后可瓜分 150,000 USDT 奖池"],
+        [/OKX Web3 Wallet \\/ DEX trade eligible xStocks \\(TSLAx, AAPLx etc\\.\\) on Solana, zero fees during event, ranked by volume \\(top 5k share 300k USDC pool\\)/gi, "通过 OKX Web3 钱包/DEX 在 Solana 交易符合条件的 xStocks（如 TSLAx、AAPLx 等）；活动期零手续费，按成交量排名，前 5,000 名瓜分 300,000 USDC 奖池"],
+        [/Regional Vietnam campaign via @okx_vietnam; SPCXUSDT is Rebase Pre-IPO Perp \\(SpaceX price discovery\\); trading risk of loss; page may require app\\/login or be geo-restricted/gi, "该活动来自 OKX Vietnam 区域渠道；SPCXUSDT 属于 Rebase Pre-IPO 永续，反映 SpaceX 价格发现预期；交易可能亏损，页面可能需要 App/登录或受地区限制"],
+        [/Confirm full terms\\/eligible pairs on the official page; high volume competition likely; onchain Solana risks \\(liquidity, slippage, smart contracts\\)/gi, "需在官方页面核验完整条款和可交易标的；成交量竞赛竞争强；Solana 链上交易存在流动性、滑点和智能合约风险"],
         [/Trade equities perps on Binance \\(65% market share reported\\)/gi, "在 Binance 交易股票/Pre-IPO 永续（来源称市场份额 65%）"],
         [/Supply liquidity or borrow against ONyc in OnRe market on Kamino/gi, "在 Kamino 的 OnRe 市场提供流动性，或用 ONyc 抵押借款"],
         [/Trade prediction markets with positive realized PNL on 3\\+ markets/gi, "交易预测市场，并在 3 个以上市场实现正收益"],
@@ -1691,6 +2795,9 @@ function buildOpportunitiesPage() {
       if (item.type === "pre_ipo") {
         return localizeText(item.risk_note, "Pre-IPO 存在估值、流动性、锁定期、地区限制和平台对手方风险。");
       }
+      if (item.type === "pre_tge") {
+        return localizeText(item.risk_note, "Pre-TGE 存在资格、女巫过滤、TGE 延期、代币解锁和合约风险。");
+      }
       if (item.type === "stablecoin_earn") {
         return localizeText(item.risk_note, "需核验 APY、额度、锁仓期限、赎回规则和地区限制。");
       }
@@ -1701,7 +2808,7 @@ function buildOpportunitiesPage() {
       const maxApy = Number(item.yield_profile?.max_apy);
       const baseApy = Number(item.yield_profile?.base_apy ?? item.apy);
       if (Number.isFinite(maxApy) && Number.isFinite(baseApy) && maxApy > baseApy) {
-        return "最高 " + maxApy + "% APY";
+        return "可参与 " + maxApy + "% APY";
       }
       if (Number.isFinite(maxApy)) return maxApy + "% APY";
       if (item.apy !== null && item.apy !== undefined) return item.apy + "% APY";
@@ -1861,6 +2968,12 @@ function buildOpportunitiesPage() {
       return high + " / " + items.length;
     }
 
+    function securityIncidentSummaryText(security) {
+      const summary = security?.summary;
+      if (!summary) return "无数据";
+      return "危急 " + Number(summary.critical || 0) + " / 异常 " + Number(summary.anomaly || 0) + " / 观察 " + Number(summary.watch || 0);
+    }
+
     function coverageQualityText(coverage) {
       const summary = coverage?.summary;
       if (!summary) return "无数据";
@@ -1921,6 +3034,10 @@ function buildOpportunitiesPage() {
     }
 
     function activityText(item) {
+      const rawName = String(item.activity_name || "");
+      if (rawName.includes("USD1") && rawName.includes("Simple Earn") && rawName.includes("灵活")) return "Binance USD1 简单赚币灵活理财";
+      if (/OKX\\s+SPCX\\s+Trade-to-Earn/i.test(rawName)) return "OKX SPCX 交易赚取活动";
+      if (/OKX\\s+xStocks/i.test(rawName)) return "OKX xStocks 链上交易竞赛";
       const known = {
         "Bybit IPO Express - SpaceX Tokenized Shares": "Bybit IPO Express - SpaceX 代币化股份",
         "Bitget $SPCX SpaceX IPO Pre-Trading & Predict Contest": "Bitget $SPCX SpaceX Pre-IPO 交易与预测活动",
@@ -1928,7 +3045,10 @@ function buildOpportunitiesPage() {
         "Bybit Football Season 2026 Predict & Earn": "Bybit 2026 足球赛季预测赚取活动",
         "Binance USD1 Simple Earn Flexible": "Binance USD1 灵活理财",
         "Bybit EU Fixed Earn USDC High APR": "Bybit EU USDC 定期高息理财",
-        "Binance Pre-IPO Perps SpaceX/OpenAI Dominance": "Binance Pre-IPO 永续：SpaceX/OpenAI"
+        "USD1 Simple Earn 灵活": "Binance USD1 简单赚币灵活理财",
+        "Binance Pre-IPO Perps SpaceX/OpenAI Dominance": "Binance Pre-IPO 永续：SpaceX/OpenAI",
+        "OKX SPCX Trade-to-Earn 活动": "OKX SPCX 交易赚取活动",
+        "OKX xStocks 交易竞赛": "OKX xStocks 链上交易竞赛"
       };
       return known[item.activity_name] || localizeText(item.activity_name, "未命名活动");
     }
@@ -1965,46 +3085,88 @@ function buildOpportunitiesPage() {
       return text + "：" + detail;
     }
 
+    function yieldSortValue(item) {
+      const values = [item.yield_profile?.eligible_apy, item.yield_profile?.max_apy, item.apy]
+        .map(Number)
+        .filter(Number.isFinite);
+      return values.length ? Math.max.apply(null, values) : 0;
+    }
+
+    function displaySortRank(item) {
+      const ranks = { stablecoin_yield: 0, quick_opportunity: 1, watch_opportunity: 2 };
+      return ranks[item.display_category] ?? 3;
+    }
+
+    function deadlineSortValue(item) {
+      const deadline = Date.parse(item.deadline_at || "");
+      return Number.isFinite(deadline) ? deadline : Number.POSITIVE_INFINITY;
+    }
+
+    function sortByYieldDesc(items) {
+      return [...items].sort((a, b) =>
+        displaySortRank(a) - displaySortRank(b) ||
+        yieldSortValue(b) - yieldSortValue(a) ||
+        String(b.last_seen_at || "").localeCompare(String(a.last_seen_at || ""))
+      );
+    }
+
+    function sortByDeadlineAsc(items) {
+      return [...items].sort((a, b) =>
+        displaySortRank(a) - displaySortRank(b) ||
+        deadlineSortValue(a) - deadlineSortValue(b) ||
+        yieldSortValue(b) - yieldSortValue(a) ||
+        String(b.last_seen_at || "").localeCompare(String(a.last_seen_at || ""))
+      );
+    }
+
     function defaultItems() {
-      return state.items.filter((item) => item.status !== "unverified");
+      return state.sortMode === "deadline" ? sortByDeadlineAsc(state.items) : sortByYieldDesc(state.items);
+    }
+
+    function tabItems(items) {
+      if (state.activeTab === "all") return items;
+      if (state.activeTab === "urgent") {
+        return items.filter((item) => item.urgency?.level === "urgent" || item.urgency?.level === "soon");
+      }
+      if (state.activeTab === "cex") return items.filter((item) => item.section !== "onchain");
+      if (state.activeTab === "onchain") return items.filter((item) => item.section === "onchain");
+      return items.filter((item) => item.display_category === state.activeTab);
+    }
+
+    function matchesToolbarFilters(item) {
+      if (state.exchangeFilter !== "all") {
+        if (state.exchangeFilter === "__onchain") {
+          if (item.section !== "onchain") return false;
+        } else {
+          const venue = String(item.exchange || item.venue || "").toLowerCase();
+          if (!venue.includes(state.exchangeFilter.toLowerCase())) return false;
+        }
+      }
+
+      const campaign = item.campaign_profile || {};
+      if (state.quotaFilter !== "all" && campaign.quota_type !== state.quotaFilter) return false;
+      if (state.lockFilter === "flexible" && campaign.lock_type !== "flexible") return false;
+      if (state.lockFilter === "locked" && campaign.lock_type !== "locked") return false;
+      if (state.lockFilter === "unknown" && campaign.lock_type !== "unknown") return false;
+      return true;
     }
 
     function filteredItems() {
-      const baseItems = state.activeTab === "unverified" ? state.items : defaultItems();
-      if (state.activeTab === "all") return baseItems;
-      if (state.activeTab === "new") {
-        return baseItems.filter((item) => item.freshness?.level === "new" || item.freshness?.level === "recent_24");
-      }
-      if (state.activeTab === "urgent") {
-        return baseItems.filter((item) => item.urgency?.level === "urgent" || item.urgency?.level === "soon");
-      }
-      if (state.activeTab === "watch") return baseItems.filter((item) => item.review?.label === "观察项");
-      if (state.activeTab === "high_risk") return baseItems.filter((item) => Number(item.risk_profile?.score || 0) >= 4);
-      if (state.activeTab === "unverified") return state.items.filter((item) => item.status === "unverified");
-      if (state.activeTab === "onchain") return baseItems.filter((item) => item.section === "onchain");
-      if (state.activeTab === "stablecoin_earn") return baseItems.filter((item) => item.type === "stablecoin_earn");
-      return baseItems.filter((item) => item.type === state.activeTab && item.section !== "onchain");
+      return tabItems(defaultItems()).filter(matchesToolbarFilters);
     }
 
     function renderTabs() {
       const tabs = document.getElementById("tabs");
       const baseItems = defaultItems();
       tabs.innerHTML = tabDefs.map(([id, label]) => {
-        const count = id === "all" ? baseItems.length : id === "urgent"
+        const count = id === "all" ? baseItems.length
+          : id === "urgent"
           ? baseItems.filter((item) => item.urgency?.level === "urgent" || item.urgency?.level === "soon").length
-          : id === "new"
-            ? baseItems.filter((item) => item.freshness?.level === "new" || item.freshness?.level === "recent_24").length
-          : id === "watch"
-            ? baseItems.filter((item) => item.review?.label === "观察项").length
-          : id === "high_risk"
-            ? baseItems.filter((item) => Number(item.risk_profile?.score || 0) >= 4).length
+          : id === "cex"
+            ? baseItems.filter((item) => item.section !== "onchain").length
           : id === "onchain"
-          ? baseItems.filter((item) => item.section === "onchain").length
-          : id === "unverified"
-            ? state.items.filter((item) => item.status === "unverified").length
-          : id === "stablecoin_earn"
-            ? baseItems.filter((item) => item.type === "stablecoin_earn").length
-          : baseItems.filter((item) => item.type === id && item.section !== "onchain").length;
+            ? baseItems.filter((item) => item.section === "onchain").length
+          : baseItems.filter((item) => item.display_category === id).length;
         return '<button class="tab ' + (state.activeTab === id ? 'active' : '') + '" data-tab="' + id + '">' +
           escapeHtml(label) + ' (' + count + ')</button>';
       }).join("");
@@ -2014,6 +3176,138 @@ function buildOpportunitiesPage() {
           render();
         });
       });
+    }
+
+    function exchangeOptions(items) {
+      const preferred = ["Binance", "OKX", "Bybit", "Gate", "Bitget"];
+      const values = new Set(
+        items
+          .filter((item) => item.section !== "onchain")
+          .map((item) => item.exchange || item.venue)
+          .filter(Boolean)
+      );
+      const ordered = [
+        ...preferred.filter((name) => values.has(name)),
+        ...[...values].filter((name) => !preferred.includes(name)).sort((a, b) => a.localeCompare(b))
+      ];
+      return [
+        ["all", "全部交易所"],
+        ...ordered.map((name) => [name, name]),
+        ["__onchain", "链上/DEX"]
+      ];
+    }
+
+    function selectHtml(id, label, value, options) {
+      return '<div class="filter-control"><label for="' + escapeHtml(id) + '">' + escapeHtml(label) + '</label>' +
+        '<select id="' + escapeHtml(id) + '">' +
+        options.map(([optionValue, optionLabel]) =>
+          '<option value="' + escapeHtml(optionValue) + '"' + (optionValue === value ? " selected" : "") + '>' +
+          escapeHtml(optionLabel) + '</option>'
+        ).join("") +
+        '</select></div>';
+    }
+
+    function renderFilterBar() {
+      const bar = document.getElementById("filterBar");
+      const controls = [
+        selectHtml("exchangeFilter", "交易所", state.exchangeFilter, exchangeOptions(state.items)),
+        selectHtml("quotaFilter", "额度", state.quotaFilter, [
+          ["all", "不限额度"],
+          ["unlimited", "无限额"],
+          ["capped", "有额度"],
+          ["unknown", "额度待核验"]
+        ]),
+        selectHtml("lockFilter", "赎回期", state.lockFilter, [
+          ["all", "不限赎回期"],
+          ["flexible", "活期/无锁仓"],
+          ["locked", "锁仓/赎回"],
+          ["unknown", "锁仓待核验"]
+        ]),
+        selectHtml("sortMode", "排序", state.sortMode, [
+          ["apy", "实时年利率"],
+          ["deadline", "到期时间"]
+        ])
+      ];
+      bar.innerHTML = controls.join("");
+      for (const id of ["exchangeFilter", "quotaFilter", "lockFilter", "sortMode"]) {
+        const element = document.getElementById(id);
+        element.addEventListener("change", () => {
+          state[id] = element.value;
+          render();
+        });
+      }
+    }
+
+    function uniqueByKey(items) {
+      const seen = new Set();
+      return items.filter((item) => {
+        const key = item.source_url || item.official_url || item.activity_name + "|" + (item.exchange || item.venue || "");
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+
+    function cardHtml(item, options = {}) {
+      const source = item.source_url
+        ? '<a href="' + escapeHtml(item.source_url) + '" target="_blank" rel="noreferrer">来源：' + escapeHtml(item.source_user || "X 帖") + '</a>'
+        : '<span class="muted">来源：未提供</span>';
+      const official = item.official_url
+        ? '<a href="' + escapeHtml(item.official_url) + '" target="_blank" rel="noreferrer">官方入口</a>'
+        : "";
+      const venue = item.section === "cex" ? item.exchange : item.venue;
+      const deadline = item.deadline_at
+        ? fmtTime(item.deadline_at)
+        : item.deadline_source === "no_fixed_deadline"
+          ? "无固定截止"
+          : "截止待确认";
+      const risk = riskText(item);
+      const riskShort = risk.length > 92 ? risk.slice(0, 92) + "..." : risk;
+      const participation = participationText(item);
+      const participationShort = participation.length > 120 ? participation.slice(0, 120) + "..." : participation;
+      return '<article class="opportunity-card">' +
+        '<div class="card-meta">' +
+          '<span class="tag info">' + escapeHtml(typeLabel(item.type)) + '</span>' +
+          '<span class="tag ' + reviewClass(item) + '">' + escapeHtml(reviewLabel(item)) + '</span>' +
+          '<span class="tag ' + freshnessClass(item) + '">' + escapeHtml(item.freshness?.label || "时间待确认") + '</span>' +
+        '</div>' +
+        '<h3>' + escapeHtml(activityText(item)) + '</h3>' +
+        '<div class="card-row">' +
+          '<span class="tag">' + escapeHtml(venue || "未知平台") + '</span>' +
+          '<span class="tag">' + escapeHtml(item.stablecoin || item.asset || "币种待确认") + '</span>' +
+          '<span class="tag apy">' + escapeHtml(yieldText(item)) + '</span>' +
+          '<span class="tag warn">' + escapeHtml(deadline) + '</span>' +
+        '</div>' +
+        '<p class="card-text"><span class="card-label">参与方式：</span>' + escapeHtml(participationShort) + '</p>' +
+        '<p class="card-text"><span class="card-label">主要风险：</span>' + escapeHtml(riskShort) + '</p>' +
+        '<div class="source-row">' + source + (official ? official : "") + '</div>' +
+        (options.compact ? "" : '<div class="card-row"><span class="tag ' + qualityClass(item) + '">' + escapeHtml(qualityText(item)) + '</span><span class="tag ' + riskClass(item) + '">' + escapeHtml(riskLevelText(item)) + '</span></div>') +
+        '</article>';
+    }
+
+    function renderSpotlight() {
+      const container = document.getElementById("spotlight");
+      const baseItems = defaultItems();
+      if (!baseItems.length) {
+        container.innerHTML = '<div class="empty">当前没有可直接展示的已核验机会；可切换到“待核验”查看候选。</div>';
+        return;
+      }
+      const stable = baseItems
+        .filter((item) => item.type === "stablecoin_earn")
+        .sort((a, b) => Number(b.yield_profile?.max_apy ?? b.apy ?? 0) - Number(a.yield_profile?.max_apy ?? a.apy ?? 0));
+      const urgent = baseItems.filter((item) => item.urgency?.level === "urgent" || item.urgency?.level === "soon");
+      const preTge = baseItems.filter((item) => item.type === "pre_tge");
+      const preIpo = baseItems.filter((item) => item.type === "pre_ipo");
+      const onchain = baseItems.filter((item) => item.section === "onchain");
+      const picks = uniqueByKey([
+        stable[0],
+        urgent[0],
+        preTge[0],
+        preIpo[0],
+        onchain[0],
+        ...baseItems
+      ].filter(Boolean)).slice(0, 4);
+      container.innerHTML = picks.map((item) => cardHtml(item, { compact: true })).join("");
     }
 
     function renderCoverage() {
@@ -2121,7 +3415,7 @@ function buildOpportunitiesPage() {
       const links = [sourceLink, officialLink].filter(Boolean).join(" · ");
       container.innerHTML =
         '<div class="coverage-title"><strong>稳定币理财摘要</strong><span class="muted">' +
-        escapeHtml("只统计非待核验且 APY>=8% 的 USDT/USDC/USD1 机会") + '</span></div>' +
+        escapeHtml("只统计 APY > 10% 的 USDT/USDC/USD1 机会") + '</span></div>' +
         '<div class="gap-list"><div class="gap-item"><strong>' +
         escapeHtml("最高收益：" + stablecoinTopText(summary)) + ' <span class="tag apy">最高 APY</span></strong>' +
         '<span class="muted">' + escapeHtml(highest.activity_name || "") + '</span>' +
@@ -2394,70 +3688,142 @@ function buildOpportunitiesPage() {
         '<div class="gap-list">' + issueHtml + filterHtml + actionHtml + strengthHtml + '</div>';
     }
 
+    function renderSecurityIncidents() {
+      const container = document.getElementById("securityIncidents");
+      const security = state.securityIncidents;
+      if (!security) {
+        container.innerHTML = "";
+        return;
+      }
+      const items = security.items || [];
+      const health = security.latest_health || {};
+      const skipReasons = security.skip_reasons || {};
+      const skipText = Object.keys(skipReasons).length
+        ? Object.entries(skipReasons).slice(0, 4).map(([key, value]) => key + ":" + value).join(" | ")
+        : "无";
+      const itemHtml = items.length
+        ? items.slice(0, 5).map((item) => {
+          const tone = item.alert_level === "critical" ? "risk" : item.alert_level === "anomaly" ? "warn" : "info";
+          const amount = Number.isFinite(Number(item.amount_usd)) ? "$" + Math.round(Number(item.amount_usd)).toLocaleString("en-US") : "金额未知";
+          const pushed = item.critical_pushed_at || item.anomaly_pushed_at ? "已推送" : "未推送";
+          return '<div class="gap-item"><strong>' + escapeHtml(item.project || "未知项目") +
+            ' <span class="tag ' + tone + '">' + escapeHtml(item.alert_level || "watch") + '</span></strong>' +
+            '<span class="muted">' + escapeHtml(amount + " · " + (item.incident_type || "security") + " · " + pushed) + '</span>' +
+            '<span class="muted">证据 ' + escapeHtml(String(item.evidence_score ?? "未知")) + ' · ' + escapeHtml(fmtTime(item.source_published_at)) + '</span>' +
+            (item.source_url ? '<span class="muted"><a href="' + escapeHtml(item.source_url) + '" target="_blank" rel="noreferrer">来源链接</a></span>' : "") +
+            '</div>';
+        }).join("")
+        : '<div class="gap-item"><strong>最近事件 <span class="tag info">暂无</span></strong><span class="muted">当前没有入库的安全事件。</span></div>';
+      container.innerHTML =
+        '<div class="coverage-title"><strong>安全事件监控</strong><span class="muted">最近状态：' +
+        escapeHtml(health.status || "未知") + " · " + escapeHtml(fmtTime(health.ts)) + '</span></div>' +
+        '<div class="gap-list">' +
+        '<div class="gap-item"><strong>跳过原因 <span class="tag info">' + escapeHtml(skipText) + '</span></strong><span class="muted">' +
+        escapeHtml(health.detail || "暂无运行详情") + '</span></div>' +
+        itemHtml +
+        '</div>';
+    }
+
+    function listRowHtml(item) {
+      const source = item.source_url
+        ? '<a href="' + escapeHtml(item.source_url) + '" target="_blank" rel="noreferrer">' + escapeHtml(item.source_user || "来源帖") + '</a>'
+        : '<span class="muted">未提供来源</span>';
+      const official = item.official_url
+        ? ' · <a href="' + escapeHtml(item.official_url) + '" target="_blank" rel="noreferrer">官方入口</a>'
+        : "";
+      const venue = item.section === "onchain" ? item.venue : item.exchange;
+      const asset = item.stablecoin || item.asset || "未注明";
+      const campaign = item.campaign_profile || {};
+      const duplicate = item.duplicate_profile || {};
+      const duplicateTag = Number(duplicate.source_count || 0) > 1
+        ? '<span class="tag hot">合并 ' + escapeHtml(String(duplicate.source_count)) + ' 来源</span>'
+        : "";
+      const duplicateSourceText = Number(duplicate.source_count || 0) > 1
+        ? '<span class="muted">合并来源：' + escapeHtml((duplicate.source_users || []).join(" / ") || String(duplicate.source_count) + " 个来源") +
+          (duplicate.apy_range_label ? " · " + escapeHtml(duplicate.apy_range_label) : "") + '</span>'
+        : "";
+      const deadline = item.deadline_at
+        ? fmtTime(item.deadline_at)
+        : item.deadline_source === "no_fixed_deadline"
+          ? "无固定截止"
+          : "截止待确认";
+      const paramTags = [
+        campaign.quota_label,
+        campaign.payout_label,
+        campaign.lock_label,
+        campaign.time_left_label
+      ].filter(Boolean).map((label) => '<span class="tag">' + escapeHtml(label) + '</span>').join("");
+      return '<article class="opportunity-row">' +
+        '<div class="row-title row-block"><div class="card-meta">' +
+          '<span class="tag info">' + escapeHtml(displayCategoryLabels[item.display_category] || typeLabel(item.type)) + '</span>' +
+          '<span class="tag apy">' + escapeHtml(campaign.event_type || typeLabel(item.type)) + '</span>' +
+          duplicateTag +
+          '<span class="tag ' + reviewClass(item) + '">' + escapeHtml(reviewLabel(item)) + '</span>' +
+          '<span class="tag ' + freshnessClass(item) + '">' + escapeHtml(item.freshness?.label || "时间待确认") + '</span>' +
+        '</div><h3>' + escapeHtml(activityText(item)) + '</h3>' +
+        '<div class="card-row"><span class="tag">' + escapeHtml(campaign.platform_path || venue || "未知平台") + '</span>' +
+        '<span class="tag">' + escapeHtml(item.section === "onchain" ? "链上/DEX" : "CEX") + '</span>' +
+        '<span class="tag">' + escapeHtml(asset) + '</span></div></div>' +
+        '<div class="row-block"><span class="row-label">实时年利率</span>' +
+          '<span class="tag apy">' + escapeHtml(yieldText(item)) + '</span>' +
+          yieldProfileHtml(item) +
+          '<p class="card-text">' + escapeHtml(campaign.estimated_return_label || item.display_reason || localizeText(item.reward || item.expected_yield, "收益需核验")) + '</p></div>' +
+        '<div class="row-block"><span class="row-label">参数 / 到期</span>' +
+          '<div class="card-row">' + paramTags + '</div>' +
+          '<p class="card-text">' + escapeHtml(localizeText(item.duration, "时间成本未注明")) + '</p>' +
+          '<span class="tag warn">' + escapeHtml(deadline) + '</span></div>' +
+        '<div class="row-block"><span class="row-label">参与与风险</span>' +
+          '<p class="card-text">' + escapeHtml(participationText(item)) + '</p>' +
+          '<p class="card-text"><span class="card-label">风险：</span>' + escapeHtml(riskText(item)) + '</p>' +
+          '<div class="source-row">' + source + official + duplicateSourceText + '</div></div>' +
+      '</article>';
+    }
+
     function renderTable() {
       const content = document.getElementById("content");
       const items = filteredItems();
       if (items.length === 0) {
         content.className = "empty";
-        content.textContent = state.activeTab === "onchain"
-          ? "当前没有链上/DEX active 或待核验机会。可能是本轮 xintel 没收录，也可能是来源、截止时间或收益门槛未通过。"
-          : "当前没有符合筛选条件的 active 或待核验机会。";
+        content.textContent = "当前没有未过期或两个月内待复查的机会。";
         return;
       }
       content.className = "table-wrap";
-      content.innerHTML = '<table><thead><tr>' +
-        '<th>活动</th><th>状态</th><th>交易所/项目</th><th>币种</th><th>收益</th><th>期限/截止</th>' +
-        '<th>参与方式</th><th>来源</th><th>风险</th>' +
-        '</tr></thead><tbody>' + items.map((item) => {
-          const source = item.source_url
-            ? '<a href="' + escapeHtml(item.source_url) + '" target="_blank" rel="noreferrer">' + escapeHtml(item.source_user || "X来源") + '</a>'
-            : escapeHtml(item.source_user || "未提供");
-          const venue = item.section === "cex" ? item.exchange : item.venue;
-          const missing = item.data_quality?.missing?.length
-            ? '<br><span class="muted">缺：' + escapeHtml(item.data_quality.missing.join("、")) + '</span>'
-            : "";
-          const reviewReason = item.review?.reason ? '<br><span class="muted">' + escapeHtml(item.review.reason) + '</span>' : "";
-          const riskReasons = item.risk_profile?.reasons?.length
-            ? '<br><span class="muted">' + escapeHtml(item.risk_profile.reasons.join("、")) + '</span>'
-            : "";
-          return '<tr>' +
-            '<td class="name">' + escapeHtml(activityText(item)) + '<br><span class="tag info">' + escapeHtml(typeLabel(item.type)) + '</span></td>' +
-            '<td><span class="tag ' + reviewClass(item) + '">' + escapeHtml(reviewLabel(item)) + '</span><br>' +
-              '<span class="tag ' + qualityClass(item) + '">' + escapeHtml(qualityText(item)) + '</span>' + missing + reviewReason + '</td>' +
-            '<td>' + escapeHtml(venue || "") + '<br><span class="muted">' + escapeHtml(item.section === "cex" ? "CEX" : "链上/DEX") + '</span></td>' +
-            '<td>' + escapeHtml(item.stablecoin || item.asset || "") + '</td>' +
-            '<td><span class="tag apy">' + escapeHtml(yieldText(item)) + '</span>' + yieldProfileHtml(item) +
-              '<br>' + escapeHtml(localizeText(item.reward || item.expected_yield, "")) + '</td>' +
-            '<td>' + deadlineHtml(item) + '</td>' +
-            '<td>' + participationHtml(item) + '</td>' +
-            '<td>' + source + '<br><span class="tag">' + escapeHtml(credibilityLabel(item.credibility)) + '</span>' + freshnessHtml(item) + '</td>' +
-            '<td><span class="tag ' + riskClass(item) + '">' + escapeHtml(riskLevelText(item)) + '</span><br>' +
-              '<span class="tag risk">' + escapeHtml(riskText(item)) + '</span>' + riskReasons + '</td>' +
-            '</tr>';
-        }).join("") + '</tbody></table>';
+      const sortLabel = state.sortMode === "deadline" ? "到期时间" : "实时年利率";
+      const dedupeNote = state.displayFilter?.duplicate_item_count
+        ? "；已合并 " + state.displayFilter.duplicate_item_count + " 条重复来源"
+        : "";
+      content.innerHTML =
+        '<section class="section-head"><div><h2>活动列表</h2><p>共 ' + escapeHtml(String(items.length)) +
+        ' 条。当前按' + escapeHtml(sortLabel) + '排序；新户专属已默认过滤，其余未到期活动持续展示' + escapeHtml(dedupeNote) + '。</p></div></section>' +
+        '<div class="opportunity-list">' + items.map((item) => listRowHtml(item)).join("") + '</div>';
     }
 
     function renderStatus() {
       const run = state.latestRun || {};
-      document.getElementById("lastRun").textContent = fmtTime(run.finished_at || run.started_at);
-      document.getElementById("nextRun").textContent = nextRunText(state.monitor, state.queryPlan);
-      document.getElementById("runStatus").textContent = runStatusText(run, state.monitor, state.runHealth);
-      document.getElementById("totalCount").textContent = String(state.items.length);
-      document.getElementById("coverageQuality").textContent = coverageQualityText(state.coverage);
-      document.getElementById("queryPlanSummary").textContent = queryPlanSummaryText(state.queryPlan);
-      document.getElementById("stablecoinTop").textContent = stablecoinTopText(state.stablecoinSummary);
-      document.getElementById("freshnessQuality").textContent = freshnessQualityText(state.items);
-      document.getElementById("actionableCount").textContent = actionableCountText(state.items);
-      document.getElementById("deadlineQuality").textContent = deadlineQualityText(state.items);
-      document.getElementById("officialQuality").textContent = officialQualityText(state.items);
-      document.getElementById("dataQuality").textContent = dataQualityText(state.items);
-      document.getElementById("fieldGapQuality").textContent = fieldGapQualityText(state.fieldGaps);
-      document.getElementById("enrichmentBacklogMetric").textContent = enrichmentBacklogText(state.enrichmentBacklog);
-      document.getElementById("diagnosticStatus").textContent = diagnosticStatusText(state.diagnostics);
-      document.getElementById("jobStatsSummary").textContent = jobStatsSummaryText(run);
-      document.getElementById("watchCount").textContent = watchCountText(state.items);
-      document.getElementById("urgentCount").textContent = urgentCountText(state.items);
-      document.getElementById("highRiskCount").textContent = highRiskCountText(state.items);
+      const setText = (id, value) => {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value;
+      };
+      setText("lastRun", fmtTime(run.finished_at || run.started_at));
+      setText("nextRun", nextRunText(state.monitor, state.queryPlan));
+      setText("runStatus", runStatusText(run, state.monitor, state.runHealth));
+      setText("totalCount", String(state.items.length));
+      setText("coverageQuality", coverageQualityText(state.coverage));
+      setText("queryPlanSummary", queryPlanSummaryText(state.queryPlan));
+      setText("stablecoinTop", stablecoinTopText(state.stablecoinSummary));
+      setText("freshnessQuality", freshnessQualityText(state.items));
+      setText("shortTermCount", String(state.items.filter((item) => item.display_category === "quick_opportunity").length));
+      setText("deadlineQuality", deadlineQualityText(state.items));
+      setText("officialQuality", officialQualityText(state.items));
+      setText("dataQuality", dataQualityText(state.items));
+      setText("fieldGapQuality", fieldGapQualityText(state.fieldGaps));
+      setText("enrichmentBacklogMetric", enrichmentBacklogText(state.enrichmentBacklog));
+      setText("diagnosticStatus", diagnosticStatusText(state.diagnostics));
+      setText("securityIncidentMetric", securityIncidentSummaryText(state.securityIncidents));
+      setText("jobStatsSummary", jobStatsSummaryText(run));
+      setText("watchCount", watchCountText(state.items));
+      setText("urgentCount", urgentCountText(state.items));
+      setText("highRiskCount", highRiskCountText(state.items));
     }
 
     function render() {
@@ -2468,15 +3834,21 @@ function buildOpportunitiesPage() {
       renderRunHistory();
       renderJobStats();
       renderDiagnostics();
+      renderSecurityIncidents();
       renderFieldGaps();
       renderEnrichmentBacklog();
       renderTabs();
+      renderFilterBar();
       renderTable();
     }
 
     async function load() {
-      const response = await fetch("/api/opportunities");
-      const body = await response.json();
+      const [opportunityResponse, securityResponse] = await Promise.all([
+        fetch("/api/opportunities"),
+        fetch("/api/security-incidents").catch(() => null)
+      ]);
+      const body = await opportunityResponse.json();
+      const securityBody = securityResponse ? await securityResponse.json() : null;
       state.items = body.items || [];
       state.coverage = body.coverage || null;
       state.queryPlan = body.query_plan || null;
@@ -2488,6 +3860,8 @@ function buildOpportunitiesPage() {
       state.latestRun = body.latest_run || null;
       state.runHealth = body.run_health || null;
       state.monitor = body.monitor || null;
+      state.displayFilter = body.display_filter || null;
+      state.securityIncidents = securityBody?.ok ? securityBody : null;
       render();
     }
 
@@ -2510,6 +3884,7 @@ export function createHttpServer({
   getRuntimeStatus,
   getOpportunityStatus,
   getOpportunityQueryPlan,
+  getSecurityIncidentStatus,
   tradingViewSignalStore
 }) {
   const app = express();
@@ -2536,7 +3911,8 @@ export function createHttpServer({
 
   app.get("/api/opportunities", (_req, res) => {
     try {
-      const items = getDisplayOpportunityItems(db, config);
+      const displayPayload = getDisplayOpportunityPayload(db, config);
+      const items = displayPayload.items;
       const monitor = getOpportunityStatus?.() || { enabled: false, running: false };
       const recentRuns = getOpportunityRunsWithHealth(db, monitor, 5);
       const latestRun = decorateOpportunityRun(db.getLatestOpportunityRun?.(), monitor) || stripRunHealth(recentRuns[0]) || null;
@@ -2622,6 +3998,7 @@ export function createHttpServer({
         risk: riskSummary,
         coverage,
         stablecoin_summary: stablecoinSummary,
+        display_filter: displayPayload.summary,
         field_gaps: fieldGaps,
         enrichment_backlog: enrichmentBacklog,
         collection_diagnostics: diagnostics,
@@ -2637,7 +4014,7 @@ export function createHttpServer({
 
   app.get("/api/opportunities/export.csv", (_req, res) => {
     try {
-      const items = getDisplayOpportunityItems(db, config);
+      const items = getDisplayOpportunityPayload(db, config).items;
       const csv = buildOpportunitiesCsv(items);
       res
         .type("text/csv; charset=utf-8")
@@ -2646,6 +4023,15 @@ export function createHttpServer({
     } catch (error) {
       logger.warn("opportunities_csv_failed", { error: String(error.message || error) });
       res.status(500).type("text/plain").send("opportunities_csv_failed");
+    }
+  });
+
+  app.get("/api/security-incidents", (_req, res) => {
+    try {
+      res.json(buildSecurityIncidentPayload(db, getSecurityIncidentStatus));
+    } catch (error) {
+      logger.warn("security_incidents_api_failed", { error: String(error.message || error) });
+      res.status(500).json({ ok: false, error: "security_incidents_api_failed" });
     }
   });
 

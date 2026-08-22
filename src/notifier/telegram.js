@@ -59,7 +59,7 @@ export class TelegramNotifier {
     return lines.join("\n");
   }
 
-  async send({ message }) {
+  async send({ message, chatId }) {
     if (!this.config.telegramEnabled) {
       return { ok: false, reason: "telegram_disabled" };
     }
@@ -73,7 +73,8 @@ export class TelegramNotifier {
       let timeoutMs = 12000;
 
       if (mode === "relay") {
-        if (!this.config.telegramServiceUrl || !this.config.telegramApiKey || !this.config.telegramChatId) {
+        const targetChatId = chatId || this.config.telegramChatId;
+        if (!this.config.telegramServiceUrl || !this.config.telegramApiKey || !targetChatId) {
           return { ok: false, reason: "telegram_relay_not_configured" };
         }
         const base = this.config.telegramServiceUrl.replace(/\/+$/, "");
@@ -82,17 +83,18 @@ export class TelegramNotifier {
         endpoint = `${base}${path}`;
         headers[this.config.telegramApiKeyHeader || "X-API-Key"] = this.config.telegramApiKey;
         payload = {
-          chatId: this.config.telegramChatId,
+          chatId: targetChatId,
           message
         };
         timeoutMs = 5000;
       } else {
-        if (!this.config.telegramBotToken || !this.config.telegramChatId) {
+        const targetChatId = chatId || this.config.telegramChatId;
+        if (!this.config.telegramBotToken || !targetChatId) {
           return { ok: false, reason: "telegram_direct_not_configured" };
         }
         endpoint = `https://api.telegram.org/bot${this.config.telegramBotToken}/sendMessage`;
         payload = {
-          chat_id: this.config.telegramChatId,
+          chat_id: targetChatId,
           text: message,
           disable_web_page_preview: true
         };
