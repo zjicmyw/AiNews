@@ -112,16 +112,21 @@ ${FIELD_RULES}
 `.trim();
 }
 
-function buildPreTgePrompt(config) {
+export function buildPreTgePrompt(config) {
   const lookbackHours = clampInt(config.opportunityLookbackHours, 24, 72, 24);
   return `
 用 X/Grok 做 Pre-TGE 专题搜索，范围是过去 ${lookbackHours} 小时，最多返回 6 条。只收代币生成事件（TGE）之前、普通用户仍可参与且尚未过期的明确机会。
 工具约束：只使用 x_search，最多调用 3 次；不要调用 web_extract、browser、terminal、skill 或 todo，也不要再次打开 x.com 链接。直接依据 x_search 返回的正文和元数据判断；证据不足时返回空 opportunities，不要继续搜索。
 必须覆盖：
-- 项目官方 Pre-TGE 活动、白名单、积分或空投快照、社区销售、预存款、测试网任务、早期参与活动。
+- 项目官方 Pre-TGE 代币销售、社区销售、白名单、预存款，以及已有明确资格规则和兑现动作的积分/空投快照或申领活动。
 - Binance、OKX、Bybit、Gate、Bitget 的 Pre-market/Pre-token/Pre-listing，以及与即将 TGE 代币直接相关的官方活动。
 - 优先项目官方账号、交易所官方账号；可靠 KOL 只能作为补充来源。
-排除：已完成 TGE、仅价格预测、纯融资新闻、Pre-IPO 股票、永续合约、无参与入口、无 X 来源或无法判断时效的内容。
+硬排除（即使项目方或 KOL 声称与 TGE/空投有关也不要返回）：
+- 任何测试网、激励测试网、devnet 任务或测试网积分提交；
+- 每日签到、streak、开 crate、重复链上交互、体验产品、提交反馈、泛生态活跃等“保持活跃等待潜在奖励”的任务；
+- 奖励仅写“潜在空投/可能配额”、分配公式未官宣、没有明确官方资格/申领/销售规则的早期参与活动；
+- 只有 KOL 推测的 TGE 日期、没有项目官方参与入口或具体兑现动作的内容。
+如果机会的核心价值只是免费刷活跃、做测试网或等待未来可能空投，返回空 opportunities。另排除：已完成 TGE、仅价格预测、纯融资新闻、Pre-IPO 股票、永续合约、无参与入口、无 X 来源或无法判断时效的内容。
 所有条目 type="pre_tge"。CEX 活动 section="cex" 并填写目标交易所；项目原生活动 section="onchain"、exchange=""，venue 填项目名或活动平台。
 必须写清预计 TGE/截止时间、参与步骤、资格门槛、奖励或份额，以及锁仓、地区、女巫过滤和合约风险。只输出 JSON，不要解释：
 ${OUTPUT_SCHEMA}

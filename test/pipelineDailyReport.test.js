@@ -88,6 +88,14 @@ test("opportunity daily report collects once and sends launch plus Pre-TGE", asy
         deadline_at: "2026-08-11T00:00:00.000Z",
         participation: "Complete the official task",
         source_url: "https://x.com/example/status/2"
+      },
+      {
+        activity_name: "dac_chain测试网日常任务（TGE前活跃）",
+        type: "pre_tge",
+        venue: "dac_chain",
+        reward: "潜在TGE奖励",
+        participation: "进入测试网完成每日签到streak和链上交互",
+        source_url: "https://x.com/example/status/3"
       }
     ],
     saveDailyReport: (report) => savedReports.push(report),
@@ -129,7 +137,9 @@ test("opportunity daily report collects once and sends launch plus Pre-TGE", asy
   assert.equal(sends[0].chatId, "-5535517204");
   assert.match(sends[0].message, /每日打新 \/ Pre-TGE 日报/);
   assert.match(sends[0].message, /打新 1 \| Pre-TGE 1/);
+  assert.doesNotMatch(sends[0].message, /dac_chain|测试网日常任务/);
   assert.equal(savedReports.length, 1);
+  assert.equal(savedReports[0].payload.item_count, 2);
   assert.match(savedReports[0].reportDate, /^opportunity:/);
 });
 

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { OpportunityMonitor } from "../src/opportunityMonitor.js";
+import { buildPreTgePrompt, OpportunityMonitor } from "../src/opportunityMonitor.js";
 
 function createDbStub() {
   const calls = [];
@@ -608,6 +608,9 @@ test("OpportunityMonitor daily plan only collects launch and Pre-TGE", () => {
   assert.equal(plan.lookback_hours, 24);
   assert.deepEqual(plan.jobs.map((job) => job.name), ["cex_launch", "onchain_launch", "pre_tge"]);
   assert.match(plan.jobs[1].label, /链上打新/);
+  const preTgePrompt = buildPreTgePrompt({ opportunityLookbackHours: 24 });
+  assert.match(preTgePrompt, /任何测试网、激励测试网、devnet/);
+  assert.match(preTgePrompt, /免费刷活跃、做测试网或等待未来可能空投/);
 });
 
 test("OpportunityMonitor saver plan keeps main plus one rotating matrix job", () => {

@@ -10,6 +10,7 @@ import { BinanceMajorNewsMarketMetrics } from "./binanceMajorNewsMarketMetrics.j
 import { HermesClient } from "./hermesClient.js";
 import { logger } from "./logger.js";
 import { readLines } from "./utils.js";
+import { isExcludedPreTgeTestnetOpportunity } from "./opportunityUtils.js";
 
 const BJ_TIMEZONE = "Asia/Shanghai";
 
@@ -230,7 +231,8 @@ export class EnginePipeline {
   }
 
   buildOpportunityDailyReportMessage(reportDate, items, collectionResult = {}) {
-    const rows = Array.isArray(items) ? items : [];
+    const rows = (Array.isArray(items) ? items : [])
+      .filter((item) => !isExcludedPreTgeTestnetOpportunity(item));
     const launchCount = rows.filter((item) => item.type === "launch").length;
     const preTgeCount = rows.filter((item) => item.type === "pre_tge").length;
     const lines = [
@@ -298,12 +300,13 @@ export class EnginePipeline {
       const collectionTypes = Array.isArray(this.config.opportunityCollectionTypes)
         ? this.config.opportunityCollectionTypes
         : ["launch", "pre_tge"];
-      const items = this.db.getOpportunitiesSeenSince?.(
+      const storedItems = this.db.getOpportunitiesSeenSince?.(
         startIso,
         new Date().toISOString(),
         collectionTypes,
         this.config.opportunityDailyReportMaxItems
       ) || [];
+      const items = storedItems.filter((item) => !isExcludedPreTgeTestnetOpportunity(item));
       const message = this.buildOpportunityDailyReportMessage(dateKey, items, collectionResult);
       const sendResult = await this.notifier.send({
         message,

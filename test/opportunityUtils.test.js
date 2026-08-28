@@ -309,6 +309,49 @@ test("normalizeOpportunity supports Pre-TGE opportunities", () => {
   assert.equal(item.status, "active");
 });
 
+test("normalizeOpportunity excludes Pre-TGE testnet and devnet tasks", () => {
+  const examples = [
+    {
+      activity_name: "dac_chain测试网日常任务（TGE前活跃）",
+      venue: "dac_chain",
+      participation: "每日完成签到streak、链上交互与crate开启"
+    },
+    {
+      activity_name: "Zentrix ecosystem testnet early access",
+      venue: "Zentrix",
+      participation: "Experience products and submit feedback on testnet"
+    },
+    {
+      activity_name: "Canopy积分空投资格提交",
+      venue: "Canopy",
+      participation: "使用测试网同一EVM钱包提交积分"
+    },
+    {
+      activity_name: "Example incentivized dev-net campaign",
+      venue: "Example",
+      participation: "Complete daily tasks"
+    }
+  ];
+
+  for (const example of examples) {
+    const item = normalizeOpportunity(
+      {
+        ...example,
+        type: "pre_tge",
+        section: "onchain",
+        deadline_at: "2026-09-10T00:00:00.000Z",
+        source_published_at: "2026-08-09T02:00:00.000Z",
+        source_user: "@example",
+        source_url: "https://x.com/example/status/123",
+        credibility: "official"
+      },
+      new Date("2026-08-09T04:00:00.000Z"),
+      { lookbackHours: 24 }
+    );
+    assert.equal(item, null, example.activity_name);
+  }
+});
+
 test("normalizeOpportunity keeps onchain stablecoin opportunities in the onchain category", () => {
   const item = normalizeOpportunity(
     {

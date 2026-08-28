@@ -51,6 +51,31 @@ function normalizeType(value, fallback = "") {
   return TYPE_ALIASES.get(raw) || raw || "short_term";
 }
 
+const PRE_TGE_TESTNET_PATTERN = /测试网|测试网络|开发网|\btest[\s-]?net\b|\bdev[\s-]?net\b/i;
+
+export function isExcludedPreTgeTestnetOpportunity(raw) {
+  if (!raw || typeof raw !== "object") return false;
+  const type = normalizeType(raw.type || raw.category, raw.product_type);
+  if (type !== "pre_tge") return false;
+  const text = [
+    raw.activity_name,
+    raw.name,
+    raw.title,
+    raw.venue,
+    raw.project,
+    raw.reward,
+    raw.rewards,
+    raw.expected_yield,
+    raw.participation,
+    raw.how_to_join,
+    raw.duration,
+    raw.deadline_text,
+    raw.risk_note,
+    raw.raw_json
+  ].map(cleanText).join(" ");
+  return PRE_TGE_TESTNET_PATTERN.test(text);
+}
+
 function normalizeSection(value, type, exchange) {
   const raw = cleanText(value).toLowerCase();
   if (raw === "onchain" || raw === "dex" || type === "onchain") return "onchain";
@@ -344,6 +369,7 @@ export function normalizeOpportunity(raw, now = new Date(), options = {}) {
     return null;
   }
   const type = normalizeType(raw.type || raw.category, raw.product_type);
+  if (isExcludedPreTgeTestnetOpportunity(raw)) return null;
   const section = normalizeSection(raw.section, type, exchange);
   const venue = cleanText(raw.venue || exchange || raw.project || raw.protocol);
   const asset = cleanText(raw.asset || raw.coin || raw.token || raw.currency).toUpperCase();
@@ -439,6 +465,7 @@ const DROP_REASON_LABELS = {
   outside_lookback: "超出时间窗口",
   expired: "已过期",
   duplicate: "重复来源",
+  excluded_testnet_task: "排除测试网任务",
   unknown_filtered: "未通过筛选"
 };
 
@@ -460,6 +487,7 @@ function classifyNormalizeDrop(raw, now = new Date(), options = {}) {
   }
 
   const type = normalizeType(raw.type || raw.category, raw.product_type);
+  if (isExcludedPreTgeTestnetOpportunity(raw)) return "excluded_testnet_task";
   const section = normalizeSection(raw.section, type, exchange);
   const asset = cleanText(raw.asset || raw.coin || raw.token || raw.currency).toUpperCase();
   const stablecoin = extractStablecoin(raw, asset);
