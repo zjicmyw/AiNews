@@ -272,7 +272,7 @@ export class SecurityIncidentMonitor {
   constructor({ config, db, notifier, hermesClient }) {
     this.config = config;
     this.db = db;
-    this.notifier = notifier || new TelegramNotifier(config);
+    this.notifier = notifier || new TelegramNotifier(config, db);
     this.hermesClient = hermesClient || new HermesClient(config, { minIntervalMs: 0 });
     this.isRunning = false;
     this.timer = null;
@@ -327,11 +327,11 @@ export class SecurityIncidentMonitor {
         ? this.config.securityIncidentCriticalChatId
         : this.config.securityIncidentAnomalyChatId;
     const message = buildSecurityIncidentMessage(effective);
-    const sendResult = await this.notifier.send({ message, chatId });
+    const sendResult = await this.notifier.send({ message, chatId, businessId: `security:${effective.dedup_key}:${effective.alert_level}`, kind: "security_incident" });
     if (sendResult.ok) {
       this.db.markSecurityIncidentPushed?.(effective.dedup_key, effective.alert_level);
     }
-    return { pushed: sendResult.ok, reason: sendResult.ok ? "sent" : sendResult.reason };
+    return { pushed: sendResult.ok, reason: sendResult.status || sendResult.reason };
   }
 
   async runOnce(trigger = "timer") {

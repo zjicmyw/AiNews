@@ -1,3 +1,4 @@
+import { buildBusinessDeliveryEvidence } from "./businessDelivery.js";
 import express from "express";
 import { logger } from "./logger.js";
 import { buildCexCoverage } from "./opportunityAnalytics.js";
@@ -3892,6 +3893,11 @@ export function createHttpServer({
 
   app.get("/health", (_req, res) => {
     res.json({ ok: true, ts: new Date().toISOString(), stats: db.getStats() });
+  });
+
+  app.get("/api/business-delivery", (_req, res) => {
+    try { res.json(buildBusinessDeliveryEvidence(db, config)); }
+    catch { res.status(503).json({ ok: false, error: "business_delivery_evidence_unavailable" }); }
   });
 
   app.get("/status.json", (_req, res) => {

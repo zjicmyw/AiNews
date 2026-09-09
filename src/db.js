@@ -112,6 +112,35 @@ export class DbClient {
         payload TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS notification_delivery (
+        business_id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        task_id TEXT,
+        message_id TEXT,
+        accepted_at TEXT,
+        completed_at TEXT,
+        checked_at TEXT,
+        created_at TEXT NOT NULL,
+        reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_notification_delivery_status ON notification_delivery(status, checked_at);
+      CREATE INDEX IF NOT EXISTS idx_notification_delivery_group ON notification_delivery(group_id);
+      CREATE INDEX IF NOT EXISTS idx_notification_delivery_created ON notification_delivery(created_at);
+      CREATE TABLE IF NOT EXISTS notification_batches (
+        group_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        report_date TEXT NOT NULL,
+        due_at TEXT NOT NULL,
+        expected_parts INTEGER NOT NULL,
+        payload_json TEXT,
+        created_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS opportunity_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         started_at TEXT NOT NULL,
@@ -200,6 +229,7 @@ export class DbClient {
       CREATE INDEX IF NOT EXISTS idx_security_incidents_alert_level ON security_incidents(alert_level);
     `);
 
+    ensureColumn(this.db, "notification_batches", "payload_json", "TEXT");
     ensureColumn(this.db, "opportunities", "official_url", "TEXT");
     ensureColumn(this.db, "opportunities", "official_url_source", "TEXT");
     ensureColumn(this.db, "opportunities", "deadline_source", "TEXT");
@@ -931,6 +961,82 @@ export class DbClient {
          ON CONFLICT(user_id) DO UPDATE SET since_id=excluded.since_id, updated_at=excluded.updated_at`
       )
       .run(userId, sinceId, new Date().toISOString());
+  }
+
+  getNotificationDelivery(businessId) {
+    return this.db.prepare("SELECT * FROM notification_delivery WHERE business_id=?").get(businessId) || null;
+  }
+
+  claimNotificationDelivery(row) {
+    const result = this.db.prepare(`INSERT OR IGNORE INTO notification_delivery
+      (business_id, group_id, kind, mode, idempotency_key, payload_hash, status, created_at, reason)
+      VALUES (@business_id, @group_id, @kind, @mode, @idempotency_key, @payload_hash, 'unknown', @created_at, 'submission_intent')`).run(row);
+    if (result.changes === 1) return true;
+    // A configuration failure has no submission intent and is safe to submit once repaired.
+    return this.db.prepare(`UPDATE notification_delivery SET status='unknown', reason='submission_intent',
+      mode=@mode, idempotency_key=@idempotency_key, payload_hash=@payload_hash,
+      created_at=@created_at, checked_at=NULL
+      WHERE business_id=@business_id AND status='failed' AND reason='configuration_missing'`).run(row).changes === 1;
+  }
+
+  recordNotificationPreflight(row) {
+    this.db.prepare(`INSERT OR IGNORE INTO notification_delivery
+      (business_id,group_id,kind,mode,idempotency_key,payload_hash,status,created_at,reason)
+      VALUES (@business_id,@group_id,@kind,@mode,@idempotency_key,@payload_hash,'failed',@created_at,'configuration_missing')`).run(row);
+  }
+
+  updateNotificationDelivery(businessId, result) {
+    this.db.prepare(`UPDATE notification_delivery SET status=@status,
+      task_id=COALESCE(@task_id,task_id), message_id=COALESCE(@message_id,message_id),
+      accepted_at=COALESCE(accepted_at,@accepted_at), completed_at=COALESCE(@completed_at,completed_at),
+      checked_at=@checked_at, reason=@reason WHERE business_id=@business_id AND status NOT IN ('sent','suppressed')`).run({
+      business_id: businessId, status: result.status, task_id: result.taskId || null,
+      message_id: result.messageId ? String(result.messageId) : null,
+      accepted_at: result.acceptedAt || null, completed_at: result.completedAt || null,
+      checked_at: new Date().toISOString(), reason: result.reason || null
+    });
+  }
+
+  getNotificationReconciliation(limit = 20) {
+    return this.db.prepare(`SELECT * FROM notification_delivery
+      WHERE mode='relay' AND status IN ('queued','unknown') AND created_at >= ?
+      AND (checked_at IS NULL OR checked_at < ?) ORDER BY COALESCE(checked_at,created_at) LIMIT ?`)
+      .all(new Date(Date.now() - 2 * 86400000).toISOString(), new Date(Date.now() - 30000).toISOString(), Math.min(20, Math.max(1, limit)));
+  }
+
+  claimNotificationBatch({ groupId, kind, reportDate, scheduledTime, expectedParts, messages, chatId, payload }) {
+    const dueAt = new Date(`${reportDate}T${scheduledTime}:00+08:00`).toISOString();
+    return this.db.prepare(`INSERT OR IGNORE INTO notification_batches
+      (group_id,kind,report_date,due_at,expected_parts,payload_json,created_at) VALUES (?,?,?,?,?,?,?)`)
+      .run(groupId, kind, reportDate, dueAt, expectedParts, messages ? JSON.stringify({ messages, chatId, payload, scheduledTime }) : null, new Date().toISOString()).changes === 1;
+  }
+
+  getNotificationBatch(groupId) {
+    return this.db.prepare("SELECT * FROM notification_batches WHERE group_id=?").get(groupId) || null;
+  }
+
+  getNotificationBatchesToResume() {
+    return this.db.prepare(`SELECT * FROM notification_batches b WHERE created_at >= ? AND payload_json IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM daily_reports d WHERE d.report_date=b.group_id)
+      ORDER BY created_at LIMIT 5`).all(new Date(Date.now() - 2 * 86400000).toISOString());
+  }
+
+  getBusinessDeliveryEvidence(reportIds, since) {
+    const placeholders = reportIds.map(() => '?').join(',');
+    return {
+      batches: this.db.prepare(`SELECT * FROM notification_batches WHERE group_id IN (${placeholders})`).all(...reportIds),
+      reports: this.db.prepare(`SELECT report_date, scheduled_time, sent_at FROM daily_reports WHERE report_date IN (${placeholders})`).all(...reportIds),
+      legacy_event_unverified_count: this.db.prepare(`SELECT
+        (SELECT COUNT(*) FROM push_logs p WHERE p.push_flag=1 AND p.pushed_at >= ?
+          AND NOT EXISTS (SELECT 1 FROM notification_delivery n WHERE n.business_id='risk:' || p.event_id))
+        + (SELECT COUNT(*) FROM security_incidents s WHERE s.anomaly_pushed_at >= ?
+          AND NOT EXISTS (SELECT 1 FROM notification_delivery n WHERE n.business_id='security:' || s.dedup_key || ':anomaly'))
+        + (SELECT COUNT(*) FROM security_incidents s WHERE s.critical_pushed_at >= ?
+          AND NOT EXISTS (SELECT 1 FROM notification_delivery n WHERE n.business_id='security:' || s.dedup_key || ':critical')) AS n`)
+        .get(since, since, since).n,
+      receipts: this.db.prepare(`SELECT * FROM notification_delivery WHERE group_id IN (${placeholders})
+        OR created_at >= ? ORDER BY created_at DESC LIMIT 501`).all(...reportIds, since)
+    };
   }
 
   hasDailyReportSent(reportDate) {

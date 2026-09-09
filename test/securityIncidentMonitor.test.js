@@ -176,7 +176,7 @@ test("SecurityIncidentMonitor deduplicates anomaly alerts and sends upgrade crit
   const notifier = {
     send: async ({ message, chatId }) => {
       sends.push({ message, chatId });
-      return { ok: true, reason: "sent_relay" };
+      return { ok: true, status: "sent", reason: "gateway_confirmed" };
     }
   };
   const monitor = new SecurityIncidentMonitor({
@@ -353,7 +353,7 @@ test("TelegramNotifier relay send supports chatId override", async () => {
     requests.push({ url, options });
     return {
       ok: true,
-      text: async () => "ok"
+      json: async () => ({ success: true, status: "sent", taskId: "fixture-task", messageId: 1 })
     };
   };
 
@@ -375,8 +375,11 @@ test("TelegramNotifier relay send supports chatId override", async () => {
     assert.equal(requests[0].options.headers["X-API-Key"], "secret");
     assert.deepEqual(JSON.parse(requests[0].options.body), {
       chatId: "override-chat",
-      message: "hello"
+      message: "hello",
+      idempotencyKey: requests[0].options.headers["X-Idempotency-Key"]
     });
+    assert.equal(result.status, "sent");
+    assert.match(requests[0].options.headers["X-Idempotency-Key"], /^ainews:/);
   } finally {
     global.fetch = originalFetch;
   }

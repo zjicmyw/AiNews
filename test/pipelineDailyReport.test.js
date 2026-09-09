@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { EnginePipeline } from "../src/pipeline.js";
 
+test("failed or partial collection does not claim there are no opportunities", () => {
+  const build = (result) => EnginePipeline.prototype.buildOpportunityDailyReportMessage.call(
+    { config: { opportunityLookbackHours: 24 } }, "2026-09-08", [], result);
+  assert.match(build({ ok: false, error: "hermes_failed:ENOENT" }), /今日结果未知/);
+  assert.doesNotMatch(build({ ok: false }), /今日未发现符合条件/);
+  assert.match(build({ ok: true, partial: true }), /未完成部分结果未知/);
+  assert.match(build({ ok: true }), /今日未发现符合条件/);
+});
+
 test("daily report sends to the configured daily report chat", async () => {
   const sends = [];
   const savedReports = [];

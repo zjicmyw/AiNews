@@ -1,4 +1,5 @@
-﻿import { CollectorHub } from "./collectors/index.js";
+import { parseSchedule } from "./businessDelivery.js";
+import { CollectorHub } from "./collectors/index.js";
 import { AiAnalyzer } from "./analyzer/aiAnalyzer.js";
 import { MarketModule } from "./market/index.js";
 import { RiskEngine } from "./riskEngine.js";
@@ -52,13 +53,6 @@ function beijingDayStartUtcIso(dateKey) {
   return new Date(ms).toISOString();
 }
 
-function parseSchedule(value) {
-  const matched = String(value || "").match(/^(\d{1,2}):(\d{2})$/);
-  if (!matched) return { hour: 16, minute: 43, text: "16:43" };
-  const hour = Math.min(23, Math.max(0, Number.parseInt(matched[1], 10)));
-  const minute = Math.min(59, Math.max(0, Number.parseInt(matched[2], 10)));
-  return { hour, minute, text: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}` };
-}
 
 function publishToPushLatencySec(publishTimeIso) {
   const ts = Date.parse(publishTimeIso || "");
@@ -80,7 +74,7 @@ export class EnginePipeline {
     this.analyzer = new AiAnalyzer(config);
     this.marketModule = new MarketModule(config, tradingViewSignalStore);
     this.riskEngine = new RiskEngine(config, db);
-    this.notifier = new TelegramNotifier(config);
+    this.notifier = new TelegramNotifier(config, db);
     this.hermesClient = new HermesClient(config);
     this.opportunityMonitor = new OpportunityMonitor({ config, db, hermesClient: this.hermesClient });
     this.binanceMajorNewsMonitor = new BinanceMajorNewsMonitor({ config, hermesClient: this.hermesClient });
@@ -249,7 +243,12 @@ export class EnginePipeline {
     }
 
     if (rows.length === 0) {
-      lines.push("", "今日未发现符合条件且仍可参与的新机会。");
+      const emptyMessage = collectionResult?.ok === false
+        ? "采集失败，今日结果未知，不能据此判断没有新机会。"
+        : collectionResult?.partial
+          ? "已完成的查询未发现符合条件的新机会；未完成部分结果未知。"
+          : "今日未发现符合条件且仍可参与的新机会。";
+      lines.push("", emptyMessage);
       return lines.join("\n");
     }
 
@@ -274,6 +273,53 @@ export class EnginePipeline {
     return message;
   }
 
+  reportDeliveryPreflight({ reportKey, kind, chatId }) {
+    const result = this.notifier.preflight?.(chatId);
+    if (!result || result.ok) return true;
+    if (result.status === "failed") this.notifier.recordPreflight?.({
+      businessId: `${reportKey}:part:1`, groupId: reportKey, kind, chatId });
+    return false;
+  }
+
+  async submitDailyReportBatch({ reportKey, kind, reportDate, scheduledTime, messages, chatId, payload }) {
+    if (!this.reportDeliveryPreflight({ reportKey, kind, chatId })) return false;
+    const frozen = { messages, chatId: chatId || this.config.telegramChatId, payload, scheduledTime };
+    if (this.db.claimNotificationBatch) {
+      this.db.claimNotificationBatch({ groupId: reportKey, kind, reportDate, scheduledTime,
+        expectedParts: messages.length, ...frozen });
+      return this.resumeDailyReportBatch(this.db.getNotificationBatch(reportKey));
+    }
+    return this.resumeDailyReportBatch({ group_id: reportKey, kind, payload_json: JSON.stringify(frozen) });
+  }
+
+  async resumeDailyReportBatch(batch) {
+    if (!batch?.payload_json) return false;
+    if (this.db.hasDailyReportSent?.(batch.group_id)) return true;
+    const frozen = JSON.parse(batch.payload_json);
+    if (!this.reportDeliveryPreflight({ reportKey: batch.group_id, kind: batch.kind, chatId: frozen.chatId })) return false;
+    for (const [index, message] of frozen.messages.entries()) {
+      const result = await this.notifier.send({ message, chatId: frozen.chatId,
+        businessId: `${batch.group_id}:part:${index + 1}`, groupId: batch.group_id, kind: batch.kind });
+      // Unknown/failed submissions stop here. Already queued/sent segments are reused, never posted again.
+      if (!result.ok) return false;
+    }
+    this.db.saveDailyReport?.({ reportDate: batch.group_id, timezone: BJ_TIMEZONE,
+      scheduledTime: frozen.scheduledTime, payload: frozen.payload });
+    return true;
+  }
+
+  async resumePendingDailyReports() {
+    if (this.resumingDailyReports) return;
+    this.resumingDailyReports = true;
+    try {
+      const enabled = { opportunity_daily: this.config.opportunityDailyReportEnabled,
+        binance_major_daily: this.config.binanceMajorNewsEnabled, risk_daily: this.config.dailyReportEnabled };
+      for (const batch of this.db.getNotificationBatchesToResume?.() || []) {
+        if (enabled[batch.kind]) await this.resumeDailyReportBatch(batch);
+      }
+    } finally { this.resumingDailyReports = false; }
+  }
+
   async maybeSendOpportunityDailyReport(trigger = "timer") {
     if (!this.config.opportunityDailyReportEnabled || this.opportunityDailyReportInFlight) return;
     this.opportunityDailyReportInFlight = true;
@@ -289,6 +335,9 @@ export class EnginePipeline {
       const dateKey = beijingDateKey(now);
       const reportKey = `opportunity:${dateKey}`;
       if (this.db.hasDailyReportSent?.(reportKey)) return;
+      const priorBatch = this.db.getNotificationBatch?.(reportKey);
+      if (priorBatch) { await this.resumeDailyReportBatch(priorBatch); return; }
+      if (!this.reportDeliveryPreflight({ reportKey: reportKey, kind: "opportunity_daily", chatId: this.config.opportunityDailyReportChatId || this.config.dailyReportChatId })) return;
 
       const startIso = beijingDayStartUtcIso(dateKey);
       const endIso = now.toISOString();
@@ -308,27 +357,11 @@ export class EnginePipeline {
       ) || [];
       const items = storedItems.filter((item) => !isExcludedPreTgeTestnetOpportunity(item));
       const message = this.buildOpportunityDailyReportMessage(dateKey, items, collectionResult);
-      const sendResult = await this.notifier.send({
-        message,
-        chatId: this.config.opportunityDailyReportChatId || this.config.dailyReportChatId
-      });
-      if (!sendResult.ok) {
-        logger.warn("opportunity_daily_report_send_failed", { trigger, dateKey, reason: sendResult.reason });
-        return;
-      }
-
-      this.db.saveDailyReport?.({
-        reportDate: reportKey,
-        timezone: BJ_TIMEZONE,
-        scheduledTime: this.opportunityDailySchedule.text,
-        payload: {
-          mode: "launch_pre_tge",
-          collection_result: collectionResult,
-          item_count: items.length,
-          types: collectionTypes
-        }
-      });
-      logger.info("opportunity_daily_report_sent", {
+      if (!await this.submitDailyReportBatch({ reportKey, kind: "opportunity_daily", reportDate: dateKey,
+        scheduledTime: this.opportunityDailySchedule.text, messages: [message],
+        chatId: this.config.opportunityDailyReportChatId || this.config.dailyReportChatId,
+        payload: { mode: "launch_pre_tge", collection_result: collectionResult, item_count: items.length, types: collectionTypes } })) return;
+      logger.info("opportunity_daily_report_accepted", {
         trigger,
         date: dateKey,
         items: items.length,
@@ -472,6 +505,9 @@ export class EnginePipeline {
       const dateKey = beijingDateKey(now);
       const reportKey = `binance-major-news:${dateKey}`;
       if (this.db.hasDailyReportSent?.(reportKey)) return;
+      const priorBatch = this.db.getNotificationBatch?.(reportKey);
+      if (priorBatch) { await this.resumeDailyReportBatch(priorBatch); return; }
+      if (!this.reportDeliveryPreflight({ reportKey: reportKey, kind: "binance_major_daily", chatId: this.config.binanceMajorNewsDailyChatId || this.config.dailyReportChatId })) return;
 
       let stored = this.db.getBinanceMajorNewsRun?.(dateKey);
       if (!stored?.finished_at) stored = await this.maybeCollectBinanceMajorNewsDaily(trigger);
@@ -486,23 +522,11 @@ export class EnginePipeline {
       result.items = await this.binanceMajorNewsMarketMetrics.enrich(result.items);
 
       const messages = this.buildBinanceMajorNewsMessages(dateKey, result);
-      for (const message of messages) {
-        const sendResult = await this.notifier.send({
-          message,
-          chatId: this.config.binanceMajorNewsDailyChatId || this.config.dailyReportChatId
-        });
-        if (!sendResult.ok) {
-          logger.warn("binance_major_news_report_send_failed", { trigger, dateKey, reason: sendResult.reason });
-          return;
-        }
-      }
-      this.db.saveDailyReport?.({
-        reportDate: reportKey,
-        timezone: BJ_TIMEZONE,
-        scheduledTime: this.binanceMajorNewsSchedule.text,
-        payload: { status: result.status, universe_count: result.universeCount, item_count: result.items.length }
-      });
-      logger.info("binance_major_news_report_sent", {
+      if (!await this.submitDailyReportBatch({ reportKey, kind: "binance_major_daily", reportDate: dateKey,
+        scheduledTime: this.binanceMajorNewsSchedule.text, messages,
+        chatId: this.config.binanceMajorNewsDailyChatId || this.config.dailyReportChatId,
+        payload: { status: result.status, universe_count: result.universeCount, item_count: result.items.length } })) return;
+      logger.info("binance_major_news_report_accepted", {
         trigger,
         date: dateKey,
         status: result.status,
@@ -531,6 +555,9 @@ export class EnginePipeline {
 
       const dateKey = beijingDateKey(now);
       if (this.db.hasDailyReportSent(dateKey)) return;
+      const priorBatch = this.db.getNotificationBatch?.(dateKey);
+      if (priorBatch) { await this.resumeDailyReportBatch(priorBatch); return; }
+      if (!this.reportDeliveryPreflight({ reportKey: dateKey, kind: "risk_daily", chatId: this.config.dailyReportChatId })) return;
 
       const startIso = beijingDayStartUtcIso(dateKey);
       const endIso = now.toISOString();
@@ -561,20 +588,9 @@ export class EnginePipeline {
         };
       }
 
-      const sendResult = await this.notifier.send({ message, chatId: this.config.dailyReportChatId });
-
-      if (!sendResult.ok) {
-        logger.warn("daily_report_send_failed", { trigger, dateKey, reason: sendResult.reason });
-        return;
-      }
-
-      this.db.saveDailyReport({
-        reportDate: dateKey,
-        timezone: BJ_TIMEZONE,
-        scheduledTime: this.dailySchedule.text,
-        payload
-      });
-      logger.info("daily_report_sent", {
+      if (!await this.submitDailyReportBatch({ reportKey: dateKey, kind: "risk_daily", reportDate: dateKey,
+        scheduledTime: this.dailySchedule.text, messages: [message], chatId: this.config.dailyReportChatId, payload })) return;
+      logger.info("daily_report_accepted", {
         trigger,
         date: dateKey,
         total_events: dailyInput.stats.total_events,
@@ -682,13 +698,13 @@ export class EnginePipeline {
         degraded
       });
 
-      const sendResult = await this.notifier.send({ message });
+      const sendResult = await this.notifier.send({ message, businessId: `risk:${inserted.eventId}`, kind: "risk_event" });
       this.db.insertPushLog({
         event_id: inserted.eventId,
         dedup_key: inserted.dedupKey,
         level: levelToPush,
         push_flag: sendResult.ok,
-        push_reason: sendResult.ok ? (degraded ? "degraded_level2_sent" : "sent") : sendResult.reason,
+        push_reason: sendResult.status === "sent" ? (degraded ? "degraded_level2_sent" : "sent") : (sendResult.status || sendResult.reason),
         latency_publish_to_push_sec: latencySec,
         payload: {
           event,
@@ -766,6 +782,8 @@ export class EnginePipeline {
     if (this.isRunning) return;
     this.isRunning = true;
 
+    await this.notifier.reconcilePending?.();
+    await this.resumePendingDailyReports();
     const newsCycleEnabled = this.shouldRunNewsCycle();
     if (newsCycleEnabled) {
       await this.runCycle();
@@ -785,6 +803,8 @@ export class EnginePipeline {
     }
 
     this.dailyReportTimer = setInterval(async () => {
+      await this.notifier.reconcilePending?.();
+      await this.resumePendingDailyReports();
       await this.maybeCollectBinanceMajorNewsDaily("timer");
       await this.maybeSendBinanceMajorNewsDailyReport("timer");
       await this.maybeSendOpportunityDailyReport("timer");

@@ -3,6 +3,13 @@
 Crypto 风险新闻辅助系统：采集宏观/地缘新闻，结合市场确认，计算风险分级并推送 Telegram。
 
 ## 已实现模块
+### Hermes 订阅接入恢复（2026-09-08）
+
+- 决定：沿用现有日报的 `xintel` profile，通过 `xai-oauth` 接入 Grok 4.5 与 X Search，替代丢失的 Hermes 安装；不新增日报调度。
+- 程序入口：`/Users/easthash/.local/bin/hermes`；源码及独立 Python 环境：`/Users/easthash/code/hermes-agent`，恢复版本 `d4d4ecfae0c135b7bb52ff4f782ffef17bbc90c7`。
+- profile：`/Users/easthash/.hermes/profiles/xintel`。登录命令：`/Users/easthash/.local/bin/hermes --profile default auth add xai-oauth --no-browser`；凭据保存在默认用户凭据库，xintel 读取共享授权。该版本在新 profile 首次添加 OAuth 时可能误走 update-only 保存分支，因此不使用 profile 内首次登录。用户在官方浏览器页面完成授权，凭据不写入项目。
+- 当前验收：入口、订阅授权、Grok 4.5 推理与真实 X Search 已验证；会话 `20260908_192431_7f0d5c` 的工具回执为 `success=true`、`credential_source=xai-oauth`。完整日报生成与最终送达仍以之后的实际业务批次核验，本次未补发日报。
+
 - Collector: RSS + GDELT + X 白名单
 - Analyzer: AI 可配置（Grok/Gemini）结构化 JSON（失败自动降级到启发式）
 - Market: BTC / 美股代理 / 黄金 / DXY(代理) 的主备源与异常检测
@@ -183,3 +190,18 @@ npm run pm2:startup
 ## 控制台链接
 - xAI Console: https://console.x.ai/
 - X Developer Console: https://console.x.com/
+
+## 业务消息交付证据
+
+`GET /api/business-delivery` 是只读状态接口：仅查询 SQLite 与当前配置，不采集、不发送、不查询网关、不迁移或写库。返回最近应发日期的机会、Binance 重大消息、风险日报，以及最近 48 小时的风险／安全事件回执；不返回消息正文、chatId、凭据、幂等键或原始错误。
+
+- `reports[].business_id` 将业务日期与分段回执关联；`expected_parts / recorded_parts / sent_parts` 区分完整日报与部分发送。
+- `queued` 只表示网关接受；`sent` 必须有对应任务和 Telegram message ID。`failed`、`unknown`、`suppressed` 分别保留，不填成 sent。Gateway sent 不证明用户已阅读。
+- 配置预检在采集/生成日报和占用日期前执行；disabled 不占日期，缺配置以 failed/configuration_missing 留证，未发出 POST，修复配置后允许首次提交。真正发送在 POST 前原子写入意图并带稳定幂等键。已有 queued/sent/unknown 或明确发送失败的同一业务 ID 不会自动重新 POST。
+- 多段日报在首段提交前冻结完整消息、目标和分段清单，仅保存在本地 SQLite 内部。崩溃或首段 unknown 后，现有 tick 先对账；确认原段 queued/sent 后，只首发尚无提交意图的剩余段，不重新采集/生成内容。明确发送失败仍需针对该业务 ID 修复。最终 sent/suppressed 不会被较晚的超时或查询结果覆盖。
+- 保留旧 `daily_reports.sent_at` 与推送标记，用于既有防重复与统计兼容；这些字段表示旧应用侧接受记录，不是网关最终回执。缺少关联回执的旧日报标为 `legacy_unverified`；最近 48 小时旧事件的应用推送标记若缺回执，也计入 legacy_event_unverified_count。均不修改历史记录，也不为补证据重发。
+- 持久化最终回执沿现有日报检查 tick 执行，每轮最多 5 条只读网关查询、单条最多 3 秒；只对最近 48 小时的 queued/unknown 意图对账。超过该窗口保留历史未知记录，不无限轮询。没有新增调度器。
+- `health.status=healthy` 要求已启用日报最近应发业务均为最终 sent/suppressed，且当前事件窗口无失败、未知或排队。未出现待验收事件/尚在排队为 waiting；旧日报缺凭证、缺段、失败、未知或超出生成宽限为 warning。宽限仅用于区分等待和逾期：机会日报按已配置 Hermes 超时 × 最大查询数 + 300 秒（至少 600 秒），其他日报为 30 分钟；waiting 与 warning 均不证明送达。
+- 当前摘要只覆盖上述日期/48 小时窗口；超过 500 条的结果明确标 partial，不将截断当成全量健康。
+
+2026-09-08 决定：优先复用现有 TelegramBot `/message-status?taskId=` 与 `/message-receipt?idempotencyKey=` 及当前日报 tick；新增 `notification_delivery`、`notification_batches` 两张追加表，历史业务表保留。验收以同业务 ID 的最终回执和只读接口为准；未发生新真实业务事件时，不额外发送测试消息。

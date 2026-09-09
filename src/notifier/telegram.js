@@ -1,4 +1,5 @@
-﻿function fmtNum(value) {
+import crypto from "node:crypto";
+function fmtNum(value) {
   if (!Number.isFinite(value)) return "N/A";
   return value.toFixed(2);
 }
@@ -24,7 +25,8 @@ function formatAssetActions(assetActions) {
 }
 
 export class TelegramNotifier {
-  constructor(config) {
+  constructor(config, db = null) {
+    this.db = db;
     this.config = config;
   }
 
@@ -59,66 +61,123 @@ export class TelegramNotifier {
     return lines.join("\n");
   }
 
-  async send({ message, chatId }) {
-    if (!this.config.telegramEnabled) {
-      return { ok: false, reason: "telegram_disabled" };
-    }
+  asResult(row) {
+    return { ok: ["queued", "sent", "suppressed"].includes(row.status), status: row.status,
+      reason: row.reason || row.status, taskId: row.task_id || null, messageId: row.message_id || null };
+  }
 
+  parseReceipt(body, responseOk, mode) {
+    const now = new Date().toISOString();
+    if (mode === "direct") {
+      if (responseOk && body?.ok === true && body.result?.message_id) {
+        return { status: "sent", reason: "telegram_confirmed", messageId: body.result.message_id, acceptedAt: now, completedAt: now };
+      }
+      return { status: body?.ok === false ? "failed" : "unknown", reason: "direct_unconfirmed" };
+    }
+    const base = { taskId: body?.taskId || null, messageId: body?.messageId || null };
+    if (body?.deliveryUnknown || body?.status === "delivery_unknown") return { ...base, status: "unknown", reason: "gateway_delivery_unknown" };
+    if (responseOk && body?.success === true) {
+      if (body.status === "sent" && body.taskId && body.messageId) return { ...base, status: "sent", reason: "gateway_confirmed", acceptedAt: body.createdAt || now, completedAt: body.completedAt || now };
+      if (["queued", "sending", "retrying", "pending", "processing", "retry_scheduled"].includes(body.status) && body.taskId) return { ...base, status: "queued", reason: "gateway_accepted", acceptedAt: body.createdAt || now };
+      if (body.status === "suppressed") return { ...base, status: "suppressed", reason: "gateway_suppressed", completedAt: now };
+    }
+    if (["failed", "expired"].includes(body?.status) || body?.success === false) return { ...base, status: "failed", reason: "gateway_rejected" };
+    return { ...base, status: "unknown", reason: "invalid_gateway_receipt" };
+  }
+
+  preflight(chatId) {
+    if (!this.config.telegramEnabled) return { ok: false, status: "disabled", reason: "telegram_disabled" };
     const mode = this.config.telegramMode === "direct" ? "direct" : "relay";
-
-    try {
-      let endpoint = "";
-      const headers = { "Content-Type": "application/json" };
-      let payload = {};
-      let timeoutMs = 12000;
-
-      if (mode === "relay") {
-        const targetChatId = chatId || this.config.telegramChatId;
-        if (!this.config.telegramServiceUrl || !this.config.telegramApiKey || !targetChatId) {
-          return { ok: false, reason: "telegram_relay_not_configured" };
-        }
-        const base = this.config.telegramServiceUrl.replace(/\/+$/, "");
-        const configuredPath = this.config.telegramServicePath || "/send-message";
-        const path = configuredPath.startsWith("/") ? configuredPath : `/${configuredPath}`;
-        endpoint = `${base}${path}`;
-        headers[this.config.telegramApiKeyHeader || "X-API-Key"] = this.config.telegramApiKey;
-        payload = {
-          chatId: targetChatId,
-          message
-        };
-        timeoutMs = 5000;
-      } else {
-        const targetChatId = chatId || this.config.telegramChatId;
-        if (!this.config.telegramBotToken || !targetChatId) {
-          return { ok: false, reason: "telegram_direct_not_configured" };
-        }
-        endpoint = `https://api.telegram.org/bot${this.config.telegramBotToken}/sendMessage`;
-        payload = {
-          chat_id: targetChatId,
-          text: message,
-          disable_web_page_preview: true
-        };
-      }
-
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: controller.signal
-      });
-      clearTimeout(timer);
-
-      const text = await response.text();
-      if (!response.ok) {
-        throw new Error(`telegram_${mode}_http_${response.status}:${text.slice(0, 200)}`);
-      }
-
-      return { ok: true, reason: `sent_${mode}` };
-    } catch {
-      // Intentionally ignore push failures to avoid blocking main loop.
-      return { ok: false, reason: "send_ignored_failure" };
+    if (!(chatId || this.config.telegramChatId) || (mode === "relay" ? !this.config.telegramServiceUrl || !this.config.telegramApiKey : !this.config.telegramBotToken)) {
+      return { ok: false, status: "failed", reason: "configuration_missing" };
     }
+    return { ok: true };
+  }
+
+  recordPreflight({ businessId, groupId, kind = "event", message = "", chatId }) {
+    const payloadHash = crypto.createHash("sha256").update(JSON.stringify([String(chatId || this.config.telegramChatId || ""), message])).digest("hex");
+    const identity = businessId || `content:${payloadHash}`;
+    this.db?.recordNotificationPreflight?.({ business_id: identity, group_id: groupId || identity, kind,
+      mode: this.config.telegramMode === "direct" ? "direct" : "relay",
+      idempotency_key: `ainews:${crypto.createHash("sha256").update(identity).digest("hex")}`,
+      payload_hash: payloadHash, created_at: new Date().toISOString() });
+  }
+
+  async send({ message, chatId, businessId, groupId, kind = "event" }) {
+    const preflight = this.preflight(chatId);
+    if (!preflight.ok) {
+      if (preflight.status === "failed") this.recordPreflight({ businessId, groupId, kind, message, chatId });
+      return preflight;
+    }
+    const mode = this.config.telegramMode === "direct" ? "direct" : "relay";
+    const targetChatId = chatId || this.config.telegramChatId;
+    const payloadHash = crypto.createHash("sha256").update(JSON.stringify([String(targetChatId), message])).digest("hex");
+    const identity = businessId || `content:${payloadHash}`;
+    const idempotencyKey = `ainews:${crypto.createHash("sha256").update(identity).digest("hex")}`;
+    if (this.db?.claimNotificationDelivery) {
+      const claimed = this.db.claimNotificationDelivery({ business_id: identity, group_id: groupId || identity,
+        kind, mode, idempotency_key: idempotencyKey, payload_hash: payloadHash, created_at: new Date().toISOString() });
+      if (!claimed) {
+        const previous = this.db.getNotificationDelivery(identity);
+        // A submitted business event is never blindly submitted again, even after a restart.
+        if (previous.payload_hash !== payloadHash) return { ok: false, status: "unknown", reason: "business_payload_conflict" };
+        return this.asResult(previous);
+      }
+    }
+    const base = String(this.config.telegramServiceUrl || "").replace(/\/+$/, "");
+    const path = `/${String(this.config.telegramServicePath || "/send-message").replace(/^\/+/, "")}`;
+    const endpoint = mode === "relay" ? `${base}${path}` : `https://api.telegram.org/bot${this.config.telegramBotToken}/sendMessage`;
+    const headers = { "Content-Type": "application/json" };
+    if (mode === "relay") {
+      headers[this.config.telegramApiKeyHeader || "X-API-Key"] = this.config.telegramApiKey;
+      headers["X-Idempotency-Key"] = idempotencyKey;
+    }
+    const payload = mode === "relay" ? { chatId: targetChatId, message, idempotencyKey }
+      : { chat_id: targetChatId, text: message, disable_web_page_preview: true };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), mode === "relay" ? 5000 : 12000);
+    let result;
+    try {
+      const response = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(payload), signal: controller.signal, redirect: "error" });
+      const body = await response.json().catch(() => null);
+      result = this.parseReceipt(body, response.ok, mode);
+    } catch {
+      result = { status: "unknown", reason: "transport_outcome_unknown" };
+    } finally {
+      clearTimeout(timer);
+    }
+    this.db?.updateNotificationDelivery?.(identity, result);
+    const persisted = this.db?.getNotificationDelivery?.(identity);
+    if (persisted) return { ...result, ...this.asResult(persisted) };
+    return { ...result, ok: ["queued", "sent", "suppressed"].includes(result.status) };
+  }
+
+  async reconcilePending() {
+    if (this.reconciling || !this.db?.getNotificationReconciliation) return;
+    if (!this.config.telegramServiceUrl || !this.config.telegramApiKey) return;
+    this.reconciling = true;
+    try {
+      for (const row of this.db.getNotificationReconciliation(5)) {
+        const endpoint = new URL(this.config.telegramServiceUrl);
+        endpoint.pathname = row.task_id ? "/message-status" : "/message-receipt";
+        endpoint.search = new URLSearchParams(row.task_id ? { taskId: row.task_id } : { idempotencyKey: row.idempotency_key }).toString();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3000);
+        let result;
+        try {
+          const response = await fetch(endpoint, { headers: { [this.config.telegramApiKeyHeader || "X-API-Key"]: this.config.telegramApiKey }, signal: controller.signal, redirect: "error" });
+          if (!response.ok) result = { status: "unknown", reason: response.status === 404 ? "receipt_unavailable" : "receipt_query_unavailable" };
+          else {
+            const body = await response.json().catch(() => null);
+            const sameIdentity = row.task_id ? body?.taskId === row.task_id : body?.idempotencyKey === row.idempotency_key;
+            result = sameIdentity ? this.parseReceipt(body, true, "relay")
+              : { status: "unknown", reason: "receipt_identity_mismatch" };
+          }
+        } catch {
+          result = { status: "unknown", reason: "receipt_query_unavailable" };
+        } finally { clearTimeout(timer); }
+        this.db.updateNotificationDelivery(row.business_id, result);
+      }
+    } finally { this.reconciling = false; }
   }
 }
