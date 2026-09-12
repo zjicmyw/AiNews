@@ -11,6 +11,7 @@
     "check": "node --check src/index.js",
     "lint": "node --check src/index.js",
     "check:apis": "node scripts/check-apis.js",
+    "recover:opportunities": "node scripts/recover-opportunity-run.js",
     "pm2:start": "pm2 start ecosystem.config.cjs --env production",
     "pm2:restart": "pm2 restart ai-news",
     "pm2:stop": "pm2 stop ai-news",

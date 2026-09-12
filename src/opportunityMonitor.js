@@ -504,7 +504,7 @@ export class OpportunityMonitor {
     return enriched.length;
   }
 
-  async runOnce(trigger = "timer") {
+  async runOnce(trigger = "timer", options = {}) {
     if (!this.config.opportunityMonitorEnabled) return { skipped: true, reason: "disabled" };
     if (this.emptyResponsePausedUntil && Date.parse(this.emptyResponsePausedUntil) > Date.now()) {
       this.nextRunAt = this.emptyResponsePausedUntil;
@@ -523,7 +523,16 @@ export class OpportunityMonitor {
     const rotationOffset = Number(latestRun?.id || 0);
     const currentItems = getCurrentOpportunityRows(this.db, this.config);
     const queryContext = buildQueryAdaptations(this.config, latestRun);
-    const promptJobs = buildSearchPrompts(this.config, rotationOffset, currentItems, queryContext);
+    const allPromptJobs = buildSearchPrompts(this.config, rotationOffset, currentItems, queryContext);
+    const requestedNames = new Set((options.onlyJobNames || []).map((value) => String(value || "").trim()).filter(Boolean));
+    const promptJobs = requestedNames.size
+      ? allPromptJobs.filter((job) => requestedNames.has(job.name))
+      : allPromptJobs;
+    if (requestedNames.size && promptJobs.length !== requestedNames.size) {
+      const available = new Set(allPromptJobs.map((job) => job.name));
+      const missing = [...requestedNames].filter((name) => !available.has(name));
+      return { skipped: true, reason: "requested_jobs_unavailable", missing };
+    }
     const prompt = promptJobs.map((job) => `## ${job.name}\n${job.prompt}`).join("\n\n");
     const startedMs = Date.now();
     const runId = this.db.startOpportunityRun?.({ startedAt: this.lastStartedAt, prompt });

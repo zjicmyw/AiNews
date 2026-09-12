@@ -109,6 +109,36 @@ test("OpportunityMonitor records a valid empty candidate response as success", a
   assert.equal(finish.row.jobStats[0].candidate_count, 0);
 });
 
+test("OpportunityMonitor recovery runs only explicitly failed query jobs", async () => {
+  const db = createDbStub();
+  db.getLatestOpportunityRun = () => ({ id: 341 });
+  const monitor = new OpportunityMonitor({
+    config: {
+      opportunityMonitorEnabled: true,
+      opportunityLookbackHours: 24,
+      opportunityMaxFollowups: 0,
+      opportunityQueryMatrixEnabled: true,
+      opportunityMaxQueryJobs: 3,
+      opportunityCollectionTypes: ["launch", "pre_tge"],
+      opportunityEnrichmentEnabled: false
+    },
+    db
+  });
+  const prompts = [];
+  monitor.callHermes = async (prompt) => {
+    prompts.push(prompt);
+    return '{"opportunities":[]}';
+  };
+
+  const result = await monitor.runOnce("recovery_test", { onlyJobNames: ["onchain_launch"] });
+  const start = db.calls.find((call) => call.name === "start");
+  const finish = db.calls.find((call) => call.name === "finish");
+  assert.equal(result.ok, true);
+  assert.equal(prompts.length, 1);
+  assert.match(start.prompt, /^## onchain_launch/m);
+  assert.deepEqual(finish.row.jobStats.map((job) => job.name), ["onchain_launch"]);
+});
+
 test("OpportunityMonitor backs off quota errors and stops remaining query jobs", async () => {
   const db = createDbStub();
   const monitor = new OpportunityMonitor({

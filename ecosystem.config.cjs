@@ -21,6 +21,7 @@ module.exports = {
         OPPORTUNITY_MONITOR_ENABLED: "true",
         OPPORTUNITY_HERMES_BIN: "/Users/easthash/.local/bin/hermes",
         OPPORTUNITY_HERMES_TIMEOUT_SEC: "600",
+        HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS: "60",
         OPPORTUNITY_INTERVAL_SEC: "86400",
         OPPORTUNITY_SCHEDULE_MODE: "daily_report",
         OPPORTUNITY_COLLECTION_TYPES: "launch,pre_tge",
