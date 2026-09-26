@@ -12,12 +12,12 @@
     });
     const text = await response.text();
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
+      throw new Error(`HTTP ${response.status}`);
     }
     try {
       return JSON.parse(text);
     } catch {
-      throw new Error(`Invalid JSON response from ${url}`);
+      throw new Error("Invalid JSON response from upstream");
     }
   } finally {
     clearTimeout(timeout);
@@ -38,7 +38,7 @@ export async function fetchText(url, options = {}, timeoutMs = 10000) {
     });
     const text = await response.text();
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
+      throw new Error(`HTTP ${response.status}`);
     }
     return text;
   } finally {

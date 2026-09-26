@@ -2,6 +2,56 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { BinanceMajorNewsMonitor, _test } from "../src/binanceMajorNewsMonitor.js";
+import { EnginePipeline } from "../src/pipeline.js";
+
+const acquisitionFixture = () => ({
+  token_name: "Synthetic Project", symbol: "ABC", score: 10, category: "acquisition",
+  acquisition_status: "signed", acquisition_scope: "project_control",
+  event_novelty: "first_disclosure", materiality: "transformative", evidence_strength: "confirmed",
+  catalyst_type: "none", catalyst_strength: "none", token_impact: "none",
+  product_change_type: "not_applicable", catalyst_path_zh: "控制权发生重大变化，代币权益安排未披露",
+  summary_zh: "合成测试：收购方签订项目收购协议，金额及代币安排未披露",
+  published_at: new Date().toISOString(), source_account: "@example", source_role: "project_official",
+  source_url: "https://x.com/example/status/1234567890"
+});
+
+test("material confirmed acquisitions survive unknown token economics at score nine", () => {
+  for (const acquisition_status of ["signed", "completed", "terminated"]) {
+    for (const acquisition_scope of ["project_control", "core_assets"]) {
+      const item = _test.normalizeItem({ ...acquisitionFixture(), acquisition_status, acquisition_scope }, new Set(["ABC"]), Date.now());
+      assert.equal(item?.score, 9);
+      assert.equal(item?.token_impact, "none");
+      assert.equal(item?.acquisition_status, acquisition_status);
+    }
+  }
+});
+
+test("acquisition exception rejects rumor, intent, minor stakes, stale news and invalid sources", () => {
+  for (const overrides of [
+    { acquisition_status: "rumor" }, { acquisition_status: "negotiating" }, { acquisition_status: "unknown" },
+    { acquisition_scope: "minority_investment" }, { acquisition_scope: "unknown" },
+    { evidence_strength: "credible_teaser" }, { materiality: "incremental" }, { event_novelty: "recap" },
+    { source_role: "media" }, { source_account: "@different" },
+    { published_at: "2020-01-01T00:00:00Z" }, { category: "funding" }, { category: "partnership" }
+  ]) assert.equal(_test.normalizeItem({ ...acquisitionFixture(), ...overrides }, new Set(["ABC"]), Date.now()), null, JSON.stringify(overrides));
+});
+
+test("acquisition collection still requires a verified source and report discloses transaction phase", async () => {
+  const monitor = new BinanceMajorNewsMonitor({ config: {}, sourceRegistry: {},
+    hermesClient: { call: async () => JSON.stringify({ items: [acquisitionFixture()] }) } });
+  monitor.getUniverse = async () => ["ABC"];
+  assert.equal((await monitor.run()).items.length, 0);
+  monitor.sourceRegistry = { ABC: [{ account: "@example", role: "project_official",
+    evidence_url: "https://example.org/team", verified_at: "2026-01-01T00:00:00Z" }] };
+  const result = await monitor.run();
+  assert.equal(result.items.length, 1);
+  const pipeline = Object.create(EnginePipeline.prototype);
+  pipeline.config = {};
+  const message = pipeline.buildBinanceMajorNewsMessages("2026-09-21", result).join("\n");
+  assert.match(message, /已签约，尚未交割/);
+  assert.match(message, /不等于代币兑付/);
+  assert.match(monitor.buildPrompt(["ABC"], new Date().toISOString()), /acquired by/);
+});
 
 test("BinanceMajorNewsMonitor builds a unique trading asset universe", async () => {
   const monitor = new BinanceMajorNewsMonitor({
@@ -117,6 +167,7 @@ test("normalizeItem keeps a product launch with direct token demand", () => {
     event_novelty: "new_launch", materiality: "high", evidence_strength: "confirmed",
     catalyst_type: "token_demand", catalyst_strength: "high", token_impact: "direct",
     product_change_type: "new_consumer_product",
+    source_role: "project_official",
     catalyst_path_zh: "新产品使用必须消耗 ABC，已公布的用户规模会直接增加代币需求",
     published_at: "2026-08-20T12:00:00.000Z", source_account: "@example",
     source_url: "https://x.com/example/status/1234567890"

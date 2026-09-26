@@ -156,6 +156,7 @@ export const config = {
   opportunityGrokDeadlineFallbackMax: toInt(process.env.OPPORTUNITY_GROK_DEADLINE_FALLBACK_MAX, 1),
 
   binanceMajorNewsEnabled: toBool(process.env.BINANCE_MAJOR_NEWS_ENABLED, true),
+  binanceMajorNewsSourcesFile: process.env.BINANCE_MAJOR_NEWS_SOURCES_FILE || "./config/project_x_sources.json",
   binanceMajorNewsCollectionTimeBj: process.env.BINANCE_MAJOR_NEWS_COLLECTION_TIME_BJ || "18:15",
   binanceMajorNewsDailyTimeBj: process.env.BINANCE_MAJOR_NEWS_DAILY_TIME_BJ || "19:01",
   binanceMajorNewsDailyChatId:

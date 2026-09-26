@@ -115,7 +115,7 @@ test("parseXintelSecurityIncidents skips missing time, missing source, and low c
       incidents: [
         baseIncident({ source_published_at: null, source_url: "https://x.com/example/status/no-time" }),
         baseIncident({ source_url: "" }),
-        baseIncident({ confidence: "low", source_url: "https://x.com/example/status/low" })
+        baseIncident({ confidence: "low", source_url: "https://x.com/example/status/3" })
       ]
     }),
     { securityIncidentIntervalSec: 600 },

@@ -3,6 +3,7 @@ import pg from "pg";
 const { Pool } = pg;
 
 function safeNumber(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }

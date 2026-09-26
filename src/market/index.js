@@ -2,30 +2,36 @@
 import { clamp, nowSec, pctChange } from "../utils.js";
 
 function toNumber(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+function historicalPoint({ source, symbol, prices, current, timestamp, toleranceSec = 300 }) {
+  const sorted = prices.filter((point) => Number.isFinite(point.time) && point.time > 0 && point.time <= timestamp && point.price > 0)
+    .sort((a, b) => b.time - a.time);
+  const latest = current > 0 ? { price: current, time: timestamp } : sorted[0];
+  const target = latest ? latest.time - 3600 : NaN;
+  const baseline = sorted.find((point) => point.time <= target && target - point.time <= toleranceSec);
+  return { source, symbol, current: latest?.price ?? null, price1hAgo: baseline?.price ?? null,
+    change1hPct: latest && baseline ? pctChange(latest.price, baseline.price) : null,
+    lastUpdateSec: latest?.time ?? null, baselineTimeSec: baseline?.time ?? null };
 }
 
 async function fetchBinancePriceAnd1h(baseUrl, symbol) {
   const [ticker, klines] = await Promise.all([
     fetchJson(`${baseUrl}/api/v3/ticker/price?symbol=${encodeURIComponent(symbol)}`),
-    fetchJson(`${baseUrl}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1h&limit=2`)
+    fetchJson(`${baseUrl}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1m&limit=65`)
   ]);
 
   const current = toNumber(ticker?.price);
-  const lastKline = Array.isArray(klines) && klines.length > 0 ? klines[klines.length - 1] : null;
-  const prevKline = Array.isArray(klines) && klines.length > 1 ? klines[0] : null;
-  const price1hAgo = prevKline ? toNumber(prevKline[4]) : null;
-  const lastCloseTimeSec = lastKline ? Math.floor(Number(lastKline[6]) / 1000) : null;
-
-  return {
-    source: "binance",
-    symbol,
-    current,
-    price1hAgo,
-    change1hPct: pctChange(current, price1hAgo),
-    lastUpdateSec: lastCloseTimeSec || nowSec()
-  };
+  const now = nowSec();
+  const prices = (Array.isArray(klines) ? klines : []).map((row) => ({ price: toNumber(row[4]), time: Math.floor(Number(row[6]) / 1000) }))
+    .filter((point) => point.time <= now);
+  const point = historicalPoint({ source: "binance", symbol, prices, current, timestamp: now, toleranceSec: 120 });
+  point.lastUpdateSec = prices.length ? Math.max(...prices.map((row) => row.time)) : null;
+  if (!(current > 0)) point.change1hPct = null;
+  return point;
 }
 
 async function fetchCoinbaseSpot(baseUrl, product) {
@@ -50,20 +56,8 @@ async function fetchMassiveMinuteChange(baseUrl, apiKey, ticker) {
   if (!Array.isArray(rows) || rows.length < 2) {
     throw new Error(`massive_not_enough_data:${ticker}`);
   }
-  const first = rows[0];
-  const last = rows[rows.length - 1];
-  const firstPrice = toNumber(first?.o ?? first?.c);
-  const lastPrice = toNumber(last?.c ?? last?.o);
-  const lastUpdateSec = Math.floor(toNumber(last?.t) / 1000) || nowSec();
-
-  return {
-    source: "massive",
-    symbol: ticker,
-    current: lastPrice,
-    price1hAgo: firstPrice,
-    change1hPct: pctChange(lastPrice, firstPrice),
-    lastUpdateSec
-  };
+  return historicalPoint({ source: "massive", symbol: ticker, timestamp: nowSec(), toleranceSec: 120,
+    prices: rows.map((row) => ({ price: toNumber(row.c), time: Math.floor(toNumber(row.t) / 1000) })) });
 }
 
 async function fetchFinnhubCandle(baseUrl, apiKey, endpoint, symbol) {
@@ -74,19 +68,8 @@ async function fetchFinnhubCandle(baseUrl, apiKey, endpoint, symbol) {
   if (json?.s !== "ok" || !Array.isArray(json?.c) || json.c.length < 2) {
     throw new Error(`finnhub_no_candle:${endpoint}:${symbol}`);
   }
-  const closes = json.c;
-  const times = json.t || [];
-  const current = toNumber(closes[closes.length - 1]);
-  const price1hAgo = toNumber(closes[0]);
-  const lastUpdateSec = toNumber(times[times.length - 1]) || nowSec();
-  return {
-    source: "finnhub",
-    symbol,
-    current,
-    price1hAgo,
-    change1hPct: pctChange(current, price1hAgo),
-    lastUpdateSec
-  };
+  return historicalPoint({ source: "finnhub", symbol, timestamp: to,
+    prices: json.c.map((price, index) => ({ price: toNumber(price), time: toNumber(json.t?.[index]) })) });
 }
 
 async function fetchFinnhubQuote(baseUrl, apiKey, symbol) {
@@ -96,17 +79,14 @@ async function fetchFinnhubQuote(baseUrl, apiKey, symbol) {
     10000
   );
   const current = toNumber(json?.c);
-  const previousClose = toNumber(json?.pc);
-  const dayOpen = toNumber(json?.o);
   const ts = toNumber(json?.t);
-  const intradayBase = Number.isFinite(dayOpen) && dayOpen > 0 ? dayOpen : previousClose;
   return {
     source: "finnhub",
     symbol,
     current,
-    price1hAgo: intradayBase,
-    change1hPct: pctChange(current, intradayBase),
-    lastUpdateSec: ts || nowSec()
+    price1hAgo: null,
+    change1hPct: null,
+    lastUpdateSec: ts
   };
 }
 
@@ -157,25 +137,31 @@ export class MarketModule {
   }
 
   async fetchBtc() {
-    const primary = await fetchBinancePriceAnd1h(this.config.binanceBaseUrl, "BTCUSDT");
-    let backup = null;
-    try {
-      backup = await fetchCoinbaseSpot(this.config.coinbaseBaseUrl, "BTC-USD");
-    } catch {
-      backup = null;
-    }
-    return { primary, backup };
+    return this.fetchCryptoPair("BTCUSDT", "BTC-USD");
   }
 
   async fetchGold() {
-    const primary = await fetchBinancePriceAnd1h(this.config.binanceBaseUrl, "PAXGUSDT");
-    let backup = null;
+    return this.fetchCryptoPair("PAXGUSDT", "PAXG-USD");
+  }
+
+  async fetchCryptoPair(symbol, product) {
+    const results = await Promise.allSettled([
+      fetchBinancePriceAnd1h(this.config.binanceBaseUrl, symbol),
+      fetchCoinbaseSpot(this.config.coinbaseBaseUrl, product)
+    ]);
+    const primary = results[0].status === "fulfilled" ? results[0].value : null;
+    const backup = results[1].status === "fulfilled" ? results[1].value : null;
+    const selected = primary?.current > 0 ? primary : backup?.current > 0 ? backup : null;
+    if (!selected) throw new Error(`market_sources_unavailable:${symbol}`);
+    return { primary: selected, backup: selected === primary ? backup : null };
+  }
+
+  async fetchFinnhubHourly(symbol) {
     try {
-      backup = await fetchCoinbaseSpot(this.config.coinbaseBaseUrl, "PAXG-USD");
-    } catch {
-      backup = null;
-    }
-    return { primary, backup };
+      const point = await fetchFinnhubCandle(this.config.finnhubBaseUrl, this.config.finnhubApiKey, "stock", symbol);
+      if (Number.isFinite(point.change1hPct)) return point;
+    } catch { /* A quote can retain the current price, never fabricate the hourly change. */ }
+    return fetchFinnhubQuote(this.config.finnhubBaseUrl, this.config.finnhubApiKey, symbol);
   }
 
   async fetchEquities() {
@@ -190,14 +176,16 @@ export class MarketModule {
           points.push(await fetchMassiveMinuteChange(this.config.massiveBaseUrl, this.config.massiveApiKey, symbol));
           continue;
         } catch {
-          points.push(await fetchFinnhubQuote(this.config.finnhubBaseUrl, this.config.finnhubApiKey, finnhubSymbol));
+          points.push(await this.fetchFinnhubHourly(finnhubSymbol));
           continue;
         }
       }
 
       // Default path: Finnhub as primary, Massive as fallback (if Massive key is available)
       try {
-        points.push(await fetchFinnhubQuote(this.config.finnhubBaseUrl, this.config.finnhubApiKey, finnhubSymbol));
+        const point = await this.fetchFinnhubHourly(finnhubSymbol);
+        if (!Number.isFinite(point.change1hPct)) throw new Error("equity_hourly_history_missing");
+        points.push(point);
       } catch {
         if (this.config.massiveApiKey) {
           points.push(await fetchMassiveMinuteChange(this.config.massiveBaseUrl, this.config.massiveApiKey, symbol));
@@ -208,7 +196,7 @@ export class MarketModule {
     }
 
     const valid = points.filter((p) => Number.isFinite(p.change1hPct));
-    if (valid.length === 0) {
+    if (valid.length !== symbols.length) {
       throw new Error("equities_no_valid_points");
     }
 
@@ -229,7 +217,8 @@ export class MarketModule {
     const symbolCandidates = [this.config.dxySymbol, "UUP", "USDX"].filter(Boolean);
     for (const symbol of symbolCandidates) {
       try {
-        return await fetchFinnhubQuote(this.config.finnhubBaseUrl, this.config.finnhubApiKey, symbol);
+        const point = await this.fetchFinnhubHourly(symbol);
+        if (Number.isFinite(point.change1hPct)) return point;
       } catch {
         // continue
       }
@@ -372,6 +361,10 @@ export class MarketModule {
 
     for (const item of [btc, gold, equities, dxy]) {
       if (!item) continue;
+      if (!Number.isFinite(item.change1hPct)) anomalyReasons.push(`${item.symbol}缺少有效1h涨跌幅`);
+      if (!Number.isFinite(item.lastUpdateSec) || item.lastUpdateSec <= 0 || item.lastUpdateSec > nowSec() + 30) {
+        anomalyReasons.push(`${item.symbol}更新时间无效`);
+      }
       const stale = asStale(item.lastUpdateSec);
       const threshold = staleThresholdFor(item);
       if (stale > threshold) {
@@ -389,7 +382,7 @@ export class MarketModule {
     }
 
     let confirmation = { confirmation_score: 0, reasons: [] };
-    if (btc && equities && gold && dxy) {
+    if ([btc, equities, gold, dxy].every((item) => item && Number.isFinite(item.change1hPct))) {
       confirmation = this.computeConfirmation({ btc, equities, gold, dxy });
     } else {
       anomalyReasons.push("确认分无法完整计算");

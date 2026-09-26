@@ -329,15 +329,18 @@ export function parseXintelOpportunities(raw) {
   if (!parsed.ok) return { ok: false, error: parsed.error, opportunities: [] };
 
   const value = parsed.value;
+  if (value && !Array.isArray(value) && (value.error || value.ok === false || value.success === false)) {
+    return { ok: false, error: "invalid_shape", opportunities: [] };
+  }
   const opportunities = Array.isArray(value)
     ? value
-    : Array.isArray(value?.opportunities)
+    : value && Object.hasOwn(value, "opportunities")
       ? value.opportunities
-      : Array.isArray(value?.items)
+      : value && Object.hasOwn(value, "items")
         ? value.items
         : value && typeof value === "object" && (value.activity_name || value.name || value.title)
           ? [value]
-          : [];
+          : null;
 
   if (!Array.isArray(opportunities)) {
     return { ok: false, error: "opportunities_not_array", opportunities: [] };

@@ -1,8 +1,21 @@
 import { logger } from "./logger.js";
+import fs from "node:fs";
+import { xStatus, canonicalSourceUrl } from "./sourceUrls.js";
+
+const SOURCE_ROLES = new Set(["project_official", "founder", "ceo", "cto", "cmo", "core_team"]);
+
+function verifiedSource(item, registry) {
+  const rows = registry?.[item.symbol];
+  return Array.isArray(rows) && rows.some((row) => row &&
+    String(row.account || "").replace(/^@/, "").toLowerCase() === item.source_account.slice(1).toLowerCase() &&
+    row.role === item.source_role && Boolean(canonicalSourceUrl(row.evidence_url)) &&
+    Number.isFinite(Date.parse(row.verified_at)) && Date.parse(row.verified_at) <= Date.now());
+}
 
 const CATEGORY_MAX_SCORE = {
   tokenomics: 10,
   funding: 9,
+  acquisition: 9,
   product: 8,
   partnership: 8,
   security: 9,
@@ -58,7 +71,7 @@ function chunk(values, size) {
 }
 
 function isOfficialXStatusUrl(value) {
-  return /^https:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/[A-Za-z0-9_]+\/status\/\d+/i.test(String(value || ""));
+  return Boolean(xStatus(value));
 }
 
 function normalizeItem(item, allowedSymbols, nowMs) {
@@ -75,10 +88,20 @@ function normalizeItem(item, allowedSymbols, nowMs) {
   const tokenImpact = String(item?.token_impact || "").trim().toLowerCase();
   const productChangeType = String(item?.product_change_type || "").trim().toLowerCase();
   const catalystPath = String(item?.catalyst_path_zh || "").replace(/\s+/g, " ").trim().slice(0, 180);
+  const acquisitionStatus = String(item?.acquisition_status || "").trim().toLowerCase();
+  const acquisitionScope = String(item?.acquisition_scope || "").trim().toLowerCase();
   if (!allowedSymbols.has(symbol) || !categoryMax || !Number.isFinite(score)) return null;
   if (!EVENT_NOVELTIES.has(eventNovelty) || !MATERIALITIES.has(materiality) || !EVIDENCE_STRENGTHS.has(evidenceStrength)) return null;
   if (!CATALYST_TYPES.has(catalystType) || !CATALYST_STRENGTHS.has(catalystStrength) || !TOKEN_IMPACTS.has(tokenImpact)) return null;
   if (!PRODUCT_CHANGE_TYPES.has(productChangeType) || catalystPath.length < 8) return null;
+
+  const isMaterialAcquisition = category === "acquisition"
+    && ["signed", "completed", "terminated"].includes(acquisitionStatus)
+    && ["project_control", "core_assets"].includes(acquisitionScope)
+    && ["new_decision", "first_disclosure", "material_change", "milestone"].includes(eventNovelty)
+    && ["high", "transformative"].includes(materiality)
+    && evidenceStrength === "confirmed";
+  if (category === "acquisition" && !isMaterialAcquisition) return null;
 
   let scoreCap = categoryMax;
   if (["ongoing_program", "recap"].includes(eventNovelty)) scoreCap = Math.min(scoreCap, 4);
@@ -86,11 +109,11 @@ function normalizeItem(item, allowedSymbols, nowMs) {
   if (materiality === "moderate") scoreCap = Math.min(scoreCap, 6);
   if (evidenceStrength === "vague") scoreCap = Math.min(scoreCap, 5);
   if (evidenceStrength === "credible_teaser") scoreCap = Math.min(scoreCap, 8);
-  if (["low", "none"].includes(catalystStrength) || catalystType === "none" || tokenImpact === "none") {
+  if (!isMaterialAcquisition && (["low", "none"].includes(catalystStrength) || catalystType === "none" || tokenImpact === "none")) {
     scoreCap = Math.min(scoreCap, 5);
   }
-  if (catalystStrength === "moderate") scoreCap = Math.min(scoreCap, 6);
-  if (tokenImpact === "indirect") scoreCap = Math.min(scoreCap, 5);
+  if (!isMaterialAcquisition && catalystStrength === "moderate") scoreCap = Math.min(scoreCap, 6);
+  if (!isMaterialAcquisition && tokenImpact === "indirect") scoreCap = Math.min(scoreCap, 5);
 
   const hasDirectCatalyst = DIRECT_CATALYST_TYPES.has(catalystType)
     && catalystStrength === "high"
@@ -115,11 +138,14 @@ function normalizeItem(item, allowedSymbols, nowMs) {
   if (!isOfficialXStatusUrl(item?.source_url)) return null;
   const sourceAccount = String(item?.source_account || "").trim();
   if (!/^@[A-Za-z0-9_]{1,15}$/.test(sourceAccount)) return null;
+  const sourceRole = String(item?.source_role || "").trim().toLowerCase();
+  if (!SOURCE_ROLES.has(sourceRole) || xStatus(item.source_url).account !== sourceAccount.slice(1).toLowerCase()) return null;
   return {
     token_name: String(item?.token_name || symbol).trim().slice(0, 80),
     symbol,
     score: adjustedScore,
     category,
+    ...(category === "acquisition" ? { acquisition_status: acquisitionStatus, acquisition_scope: acquisitionScope } : {}),
     event_novelty: eventNovelty,
     materiality,
     evidence_strength: evidenceStrength,
@@ -136,16 +162,17 @@ function normalizeItem(item, allowedSymbols, nowMs) {
     summary_zh: String(item?.summary_zh || "").replace(/\s+/g, " ").trim().slice(0, 260),
     published_at: new Date(publishedMs).toISOString(),
     source_account: sourceAccount,
-    source_role: String(item?.source_role || "project_official").trim().slice(0, 30),
-    source_url: String(item.source_url).trim()
+    source_role: sourceRole,
+    source_url: xStatus(item.source_url).url
   };
 }
 
 export class BinanceMajorNewsMonitor {
-  constructor({ config, hermesClient, fetchFn = fetch }) {
+  constructor({ config, hermesClient, fetchFn = fetch, sourceRegistry = null }) {
     this.config = config;
     this.hermesClient = hermesClient;
     this.fetchFn = fetchFn;
+    this.sourceRegistry = sourceRegistry;
   }
 
   async getUniverse() {
@@ -180,12 +207,15 @@ ${symbols.join(", ")}
 1. 对列表中的每个代币分别判断时间窗：先查该项目最近 48 小时；如果该项目没有合格消息，再查该项目第 3-5 天。不能因为同批次其他项目有消息就跳过其第 3-5 天补查。
 2. 第一次 x_search 查项目官方账号的重大公告；第二次查创始人、CEO、CTO、CMO 与核心团队的首次披露和未来交付信号；第三次用于第 3-5 天补漏及原帖验证。
 3. 搜索时主动覆盖这些未来交付表达及同义词：launching, about to launch, coming, introducing, unveil, reveal, building, shipping, ship, next chapter, under wraps, quiet building, ending hibernation, beta, testnet, mainnet, roadmap，以及“即将推出、正在开发、准备发布、结束蛰伏、进入交付阶段”。
+4. 同时主动检索 acquisition, acquired by, acquire, merger, takeover, definitive agreement, change of control，以及“收购、被收购、合并、控制权变更、核心资产出售、并购终止”。不要把并购降为普通合作或产品消息。
 
 收录规则：
 1. 已正式上线的重大产品，也收录项目官方或核心负责人首次明确确认“正在做/即将推出”的新产品、新协议、新功能、新业务方向或重大路线图。
 2. 尚未公开产品名或完整功能，但核心负责人明确使用 launching/building/shipping 等交付语言，且内容指向项目级新产品、新协议或新业务方向时，作为 credible_teaser 收录；若是首次披露、实质性高且获项目官方背书，可评 8 分。不能仅因细节尚未公布而过滤。
 3. 纯表情、纯倒计时、没有交付含义的“soon”、抽奖、AMA、社区活动、价格观点、小版本更新仍然排除。官方引用或连续帖若只是确认同一件事，合并成一个事件，不要输出多条。
 4. 若官方与核心团队发布同一事件，优先使用最早且信息最实质的原帖，并在摘要中说明官方背书；同一事件只输出一次。
+5. 项目控制权或核心资产的收购、被收购、合并，以及已签协议、交割完成、交易终止，属于 acquisition，最高 9 分。必须有窗口内新事实及官方明确确认；传闻、仅洽谈、非约束性意向不作为已确认并购收录。少数股权投资仍归 funding，普通合作归 partnership。
+6. acquisition 必须额外输出 acquisition_status（signed/completed/terminated/negotiating/rumor/unknown）与 acquisition_scope（project_control/core_assets/minority_investment/unknown）。摘要必须写明收购方、标的、阶段、金额（未披露则注明）及代币安排（未披露则注明）；不能将公司收购价格等同于代币兑付金额。
 
 评分必须先判断“新颖性”和“实质性”，再参考消息类别：
 1. event_novelty 必须选择：new_decision（窗口内新决定）、first_disclosure（首次披露）、new_launch（新产品正式上线）、material_change（已有机制发生实质改变）、milestone（可验证重大里程碑）、ongoing_program（既有计划例行执行）、recap（旧闻、累计数据或媒体再报道）。
@@ -206,6 +236,7 @@ ${symbols.join(", ")}
 6. 产品已上线、新增若干功能、包含多项 EIP、节点必须升级、主网上线日期确定，都不能单独作为催化依据。不得用“生态增长潜力”“提升采用”“长期利好”这类泛化措辞冒充传导路径。
 7. strategic_new_business 仅在核心负责人首次披露项目级全新业务方向、官方背书且预期足以改变市场叙事时例外收录；普通产品版本、单项集成和开发路线不得使用此标签。
 8. catalyst_strength 为 low/none、token_impact 为 none/indirect，或 catalyst_type 为 none，最高 5 分，不得输出。产品类消息若既没有高强度直接催化，也不满足 strategic_new_business 首次披露例外，同样最高 5 分。
+9. 明确例外：官方确认的项目控制权或核心资产重大并购（已签约、完成或终止）即使尚无代币权益安排，也应收录，不能因 token_impact=none/indirect 而过滤。须标 materiality=high/transformative、evidence_strength=confirmed，保留真实催化字段；不编造资金注入、换币或利好结论。旧闻重复不适用例外。
 
 严格规则：
 1. 仅接受项目官方 X，或 CEO/CMO/CTO/创始人/明确核心团队成员的 X 原帖。禁止新闻媒体、交易所公告、聚合账号、KOL、转述。
@@ -215,12 +246,17 @@ ${symbols.join(", ")}
 5. 使用 x_search 搜索 X，不要使用网页抓取工具。最多 3 次 x_search。不要输出解释或 Markdown，只输出 JSON。
 
 JSON：
-{"items":[{"token_name":"项目名","symbol":"代码","score":8,"category":"tokenomics|funding|product|partnership|security|team","event_novelty":"new_decision|first_disclosure|new_launch|material_change|milestone|ongoing_program|recap","materiality":"transformative|high|moderate|incremental","evidence_strength":"confirmed|credible_teaser|vague","catalyst_type":"token_supply|token_demand|revenue_value_capture|capital_inflow|market_access|distribution_adoption|material_risk|strategic_new_business|none","catalyst_strength":"high|moderate|low|none","token_impact":"direct|credible|indirect|none","product_change_type":"new_business|new_consumer_product|protocol_upgrade|hard_fork|testnet_devnet|beta_waitlist|performance_scaling|developer_tooling|ui_feature|not_applicable","catalyst_path_zh":"消息到经济变量再到代币重估的具体路径","score_reason_zh":"一句话说明新事件、实质变化及评分依据","event_key":"同一事件稳定简短标识","announcement_phase":"teaser|announced|launched","summary_zh":"消息核心内容；teaser 需说明已知信息与尚未披露信息","published_at":"ISO-8601","source_account":"@账号","source_role":"project_official|founder|ceo|cto|cmo|core_team","source_url":"https://x.com/账号/status/数字"}]}
+{"items":[{"token_name":"项目名","symbol":"代码","score":8,"category":"tokenomics|funding|acquisition|product|partnership|security|team","acquisition_status":"signed|completed|terminated|negotiating|rumor|unknown","acquisition_scope":"project_control|core_assets|minority_investment|unknown","event_novelty":"new_decision|first_disclosure|new_launch|material_change|milestone|ongoing_program|recap","materiality":"transformative|high|moderate|incremental","evidence_strength":"confirmed|credible_teaser|vague","catalyst_type":"token_supply|token_demand|revenue_value_capture|capital_inflow|market_access|distribution_adoption|material_risk|strategic_new_business|none","catalyst_strength":"high|moderate|low|none","token_impact":"direct|credible|indirect|none","product_change_type":"new_business|new_consumer_product|protocol_upgrade|hard_fork|testnet_devnet|beta_waitlist|performance_scaling|developer_tooling|ui_feature|not_applicable","catalyst_path_zh":"消息到经济变量再到代币重估的具体路径","score_reason_zh":"一句话说明新事件、实质变化及评分依据","event_key":"同一事件稳定简短标识","announcement_phase":"teaser|announced|launched","summary_zh":"消息核心内容；teaser 需说明已知信息与尚未披露信息","published_at":"ISO-8601","source_account":"@账号","source_role":"project_official|founder|ceo|cto|cmo|core_team","source_url":"https://x.com/账号/status/数字"}]}
 无合格消息输出 {"items":[]}。`;
   }
 
   async run() {
     const now = new Date();
+    let registry = this.sourceRegistry;
+    if (!registry) {
+      try { registry = JSON.parse(fs.readFileSync(this.config.binanceMajorNewsSourcesFile || "./config/project_x_sources.json", "utf8")); }
+      catch { registry = {}; }
+    }
     const universe = await this.getUniverse();
     const allowedSymbols = new Set(universe);
     const batches = chunk(universe, Math.max(30, Math.min(120, Number(this.config.binanceMajorNewsChunkSize || 60))));
@@ -230,11 +266,19 @@ JSON：
       try {
         const raw = await this.hermesClient.call(this.buildPrompt(batches[index], now.toISOString()));
         const parsed = extractJson(raw);
-        const accepted = (Array.isArray(parsed?.items) ? parsed.items : [])
+        if (!Array.isArray(parsed?.items) || parsed.error || parsed.ok === false || parsed.success === false) throw new Error("invalid_shape");
+        const normalized = parsed.items
           .map((item) => normalizeItem(item, allowedSymbols, now.getTime()))
           .filter(Boolean);
+        const accepted = normalized.filter((item) => verifiedSource(item, registry));
+        const unverified = normalized.length - accepted.length;
+        const missingSources = batches[index].filter((symbol) => !Array.isArray(registry?.[symbol]) ||
+          !registry[symbol].some((row) => row && SOURCE_ROLES.has(row.role) && /^@?[a-z0-9_]{1,15}$/i.test(row.account || "") &&
+            verifiedSource({ symbol, source_account: `@${row.account.replace(/^@/, "")}`, source_role: row.role }, registry))).length;
         items.push(...accepted);
-        diagnostics.push({ batch: index + 1, symbols: batches[index].length, status: "ok", accepted: accepted.length });
+        diagnostics.push({ batch: index + 1, symbols: batches[index].length, status: unverified || missingSources ? "partial" : "ok",
+          accepted: accepted.length, unverified_sources: unverified, symbols_without_verified_sources: missingSources,
+          ...(unverified || missingSources ? { error: "source_identity_unverified" } : {}) });
         logger.info("binance_major_news_batch_done", {
           batch: index + 1,
           batches: batches.length,
@@ -262,9 +306,9 @@ JSON：
     ])).values()]
       .sort((a, b) => b.score - a.score || Date.parse(b.published_at) - Date.parse(a.published_at))
       .slice(0, Math.max(1, Number(this.config.binanceMajorNewsMaxItems || 30)));
-    const failures = diagnostics.filter((item) => item.status === "error");
+    const failures = diagnostics.filter((item) => item.status !== "ok");
     return {
-      status: failures.length === 0 ? "ok" : failures.length === diagnostics.length ? "error" : "partial",
+      status: failures.length === 0 ? "ok" : diagnostics.every((item) => item.status === "error") ? "error" : "partial",
       universeCount: universe.length,
       items: deduped,
       diagnostics,
@@ -273,4 +317,4 @@ JSON：
   }
 }
 
-export const _test = { extractJson, normalizeItem };
+export const _test = { extractJson, normalizeItem, verifiedSource };

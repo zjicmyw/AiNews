@@ -39,6 +39,7 @@ module.exports = {
         BINANCE_MAJOR_NEWS_DAILY_TIME_BJ: "19:01",
         BINANCE_MAJOR_NEWS_CHUNK_SIZE: "60",
         BINANCE_MAJOR_NEWS_MAX_ITEMS: "30",
+        SECURITY_INCIDENT_MONITOR_ENABLED: "false",
         SECURITY_INCIDENT_INTERVAL_SEC: "1200"
       },
       out_file: "logs/engine.out.log",

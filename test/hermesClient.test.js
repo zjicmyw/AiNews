@@ -1,6 +1,32 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { HermesClient, buildHermesArgs } from "../src/hermesClient.js";
+import { OpportunityMonitor } from "../src/opportunityMonitor.js";
+
+test("quota on stdout survives session-only stderr and blocks shared queued calls", async () => {
+  let calls = 0;
+  const client = new HermesClient({ opportunityQuotaErrorBackoffSec: 43200 }, {
+    minIntervalMs: 0,
+    execFileFn: (_bin, _args, _options, callback) => {
+      calls++;
+      callback({ code: 1 }, "Billing or credits exhausted: personal-team-blocked:spending-limit", "session_id: example");
+    }
+  });
+  const results = await Promise.allSettled([client.call("one"), client.call("two")]);
+  assert.equal(calls, 1);
+  for (const result of results) {
+    assert.equal(result.status, "rejected");
+    assert.match(result.reason.message, /spending-limit/);
+  }
+  const monitor = new OpportunityMonitor({ config: { opportunityMonitorEnabled: true,
+    opportunityCollectionTypes: ["launch", "pre_tge"], opportunityQuotaErrorBackoffSec: 43200 }, db: {}, hermesClient: client });
+  assert.equal((await monitor.runOnce("quota_test")).ok, false);
+  assert.equal((await monitor.runOnce("quota_test")).reason, "xintel_quota_error_backoff");
+  assert.equal(calls, 1);
+  client.quotaBlockedUntil = Date.now() - 1;
+  await assert.rejects(client.call("after_expiry"), /spending-limit/);
+  assert.equal(calls, 2);
+});
 
 test("buildHermesArgs uses Hermes chat query mode", () => {
   assert.deepEqual(buildHermesArgs({ opportunityHermesProfile: "xintel" }, "hello"), [

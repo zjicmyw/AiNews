@@ -33,6 +33,7 @@ export class HermesClient {
     this.active = 0;
     this.lastStartedMs = 0;
     this.timer = null;
+    this.quotaBlockedUntil = 0;
   }
 
   call(prompt) {
@@ -68,6 +69,9 @@ export class HermesClient {
   }
 
   execute(prompt) {
+    if (Date.now() < this.quotaBlockedUntil) {
+      return Promise.reject(new Error(`hermes_quota_exhausted:spending-limit:retry_after=${new Date(this.quotaBlockedUntil).toISOString()}`));
+    }
     const timeoutMs = Math.max(10, Math.min(600, toInt(this.config.opportunityHermesTimeoutSec, 120))) * 1000;
     return new Promise((resolve, reject) => {
       this.execFileFn(
@@ -83,7 +87,13 @@ export class HermesClient {
           const errorOutput = String(stderr || "").trim();
           if (error) {
             const isTimeout = error.killed || error.signal === "SIGTERM";
-            const stderrDetail = compactErrorText(errorOutput || output);
+            // Hermes can put provider failures on stdout and only the session ID on stderr.
+            const quotaExhausted = /personal-team-blocked:spending-limit|billing or credits exhausted|out of credits/i.test(`${output}\n${errorOutput}`);
+            if (quotaExhausted) {
+              const backoffSec = Math.max(0, Math.min(7 * 86400, toInt(this.config.opportunityQuotaErrorBackoffSec, 43200)));
+              this.quotaBlockedUntil = Date.now() + backoffSec * 1000;
+            }
+            const stderrDetail = quotaExhausted ? "hermes_quota_exhausted:spending-limit" : compactErrorText(errorOutput || output);
             const wrapped = new Error(
               isTimeout
                 ? `hermes_timeout_after_${timeoutMs}ms`

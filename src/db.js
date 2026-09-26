@@ -1,5 +1,7 @@
 ﻿import Database from "better-sqlite3";
 import crypto from "node:crypto";
+import { canonicalSourceUrl } from "./sourceUrls.js";
+import { securitySourceKey, securityEventIdentity } from "./securityIncidentIdentity.js";
 import { ensureDirForFile, nowSec, normalizeTitle } from "./utils.js";
 
 function safeParseJson(value, fallback) {
@@ -244,6 +246,12 @@ export class DbClient {
     ensureColumn(this.db, "security_incidents", "source_type", "TEXT");
     ensureColumn(this.db, "security_incidents", "evidence_score", "REAL");
     ensureColumn(this.db, "security_incidents", "evidence_level", "TEXT");
+    ensureColumn(this.db, "security_incidents", "event_identity", "TEXT");
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_security_event_identity ON security_incidents(event_identity);
+      CREATE TABLE IF NOT EXISTS security_incident_sources (
+        source_key TEXT PRIMARY KEY, dedup_key TEXT NOT NULL, source_url TEXT NOT NULL,
+        FOREIGN KEY(dedup_key) REFERENCES security_incidents(dedup_key)
+      )`);
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_opportunities_deadline_source ON opportunities(deadline_source);
@@ -695,7 +703,36 @@ export class DbClient {
     return this.db.prepare(`SELECT * FROM security_incidents WHERE dedup_key = ?`).get(dedupKey);
   }
 
+  resolveSecurityIncidentKey(item) {
+    for (const url of [item.source_url, item.event_reference_url].filter(Boolean)) {
+      const alias = this.db.prepare(`SELECT dedup_key FROM security_incident_sources WHERE source_key=?`)
+        .get(securitySourceKey(item, url));
+      if (alias) return alias.dedup_key;
+    }
+    const identity = item.event_identity || securityEventIdentity(item);
+    const identityAlias = this.db.prepare(`SELECT dedup_key FROM security_incident_sources WHERE source_key=?`).get(`event:${identity}`);
+    if (identityAlias) return identityAlias.dedup_key;
+    const matched = this.db.prepare(`SELECT dedup_key FROM security_incidents WHERE event_identity=? OR dedup_key=? LIMIT 1`)
+      .get(identity, identity);
+    if (matched) return matched.dedup_key;
+    // Adopt the old key rather than rewriting sent markers or notification business IDs.
+    const legacy = this.db.prepare(`SELECT dedup_key, source_url FROM security_incidents
+      WHERE lower(trim(project))=lower(trim(?)) AND lower(trim(incident_type))=lower(trim(?))`)
+      .all(item.project, item.incident_type);
+    const urls = [item.source_url, item.event_reference_url].map(canonicalSourceUrl).filter(Boolean);
+    return legacy.find((row) => urls.includes(canonicalSourceUrl(row.source_url)))?.dedup_key || item.dedup_key;
+  }
+
+  setSecurityIncidentLevel(dedupKey, level) {
+    this.db.prepare(`UPDATE security_incidents SET alert_level=? WHERE dedup_key=?
+      AND (alert_level='watch' OR (alert_level='anomaly' AND ?='critical'))`).run(level, dedupKey, level);
+  }
+
   upsertSecurityIncident(item) {
+    return this.db.transaction(() => this.writeSecurityIncident(item))();
+  }
+
+  writeSecurityIncident(item) {
     const nowIso = new Date().toISOString();
     this.db
       .prepare(
@@ -774,6 +811,15 @@ export class DbClient {
         last_seen_at: nowIso,
         updated_at: nowIso
       });
+    const identity = item.event_identity || securityEventIdentity(item);
+    this.db.prepare(`UPDATE security_incidents SET event_identity=? WHERE dedup_key=?`).run(identity, item.dedup_key);
+    this.db.prepare(`INSERT OR IGNORE INTO security_incident_sources (source_key,dedup_key,source_url)
+      VALUES (?,?,?)`).run(`event:${identity}`, item.dedup_key, item.source_url || "");
+    for (const url of [item.source_url, item.event_reference_url].filter(Boolean)) {
+      const canonical = canonicalSourceUrl(url);
+      if (canonical) this.db.prepare(`INSERT OR IGNORE INTO security_incident_sources (source_key,dedup_key,source_url)
+        VALUES (?,?,?)`).run(securitySourceKey(item, url), item.dedup_key, canonical);
+    }
     return this.getSecurityIncidentByDedup(item.dedup_key);
   }
 
@@ -876,6 +922,12 @@ export class DbClient {
       )
       .get(startIso, endIso);
     return Boolean(row?.id);
+  }
+
+  getOpportunityRunSince(startIso, endIso = new Date().toISOString()) {
+    const row = this.db.prepare(`SELECT * FROM opportunity_runs WHERE started_at>=? AND started_at<?
+      ORDER BY id DESC LIMIT 1`).get(startIso, endIso);
+    return row ? { ...row, job_stats: safeParseJson(row.job_stats || "[]", []) } : null;
   }
 
   getOpportunitiesSeenSince(startIso, endIso = new Date().toISOString(), types = [], limit = 8) {

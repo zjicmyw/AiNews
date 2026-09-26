@@ -1,10 +1,21 @@
-import crypto from "node:crypto";
+import { z } from "zod";
+import { canonicalSourceUrl, xStatus } from "./sourceUrls.js";
+import { securityEventIdentity } from "./securityIncidentIdentity.js";
 import { TelegramNotifier } from "./notifier/telegram.js";
 import { HermesClient } from "./hermesClient.js";
 import { logger } from "./logger.js";
 
 const OUTPUT_SCHEMA =
-  '{"generated_at":"ISO","incidents":[{"project":"","incident_type":"hack|exploit|theft|private_key_leak|abnormal_withdrawal|bridge_attack|exchange_incident|other","amount_usd":null,"chain_platform":"","source_url":"https://x.com/.../status/...","source_user":"@","source_type":"official|security_researcher|media|kol|unknown","source_published_at":"ISO","confidence":"high|medium|low","summary":""}]}';
+  '{"generated_at":"ISO","incidents":[{"project":"","incident_type":"hack|exploit|theft|private_key_leak|abnormal_withdrawal|bridge_attack|exchange_incident|other","event_time":null,"event_reference_url":null,"amount_usd":null,"chain_platform":"","source_url":"https://x.com/.../status/...","source_user":"@","source_type":"official|security_researcher|media|kol|unknown","source_published_at":"ISO","confidence":"high|medium|low","summary":""}]}';
+
+const incidentSchema = z.object({
+  project: z.string().min(1).max(200),
+  incident_type: z.enum(["hack", "exploit", "theft", "private_key_leak", "abnormal_withdrawal", "bridge_attack", "exchange_incident", "other"]),
+  amount_usd: z.number().finite().nonnegative().nullable(),
+  source_url: z.string().url(),
+  source_published_at: z.string().datetime({ offset: true }),
+  confidence: z.enum(["high", "medium", "low"])
+});
 
 function clampInt(value, min, max, fallback) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -20,16 +31,12 @@ function normalizeConfidence(value) {
   const text = cleanText(value).toLowerCase();
   if (["confirmed", "high", "official"].includes(text)) return "high";
   if (["low", "rumor", "unverified"].includes(text)) return "low";
-  return "medium";
+  return text === "medium" ? "medium" : "low";
 }
 
 function normalizeSourceType(value) {
   const text = cleanText(value).toLowerCase();
   if (["official", "security_researcher", "media", "kol"].includes(text)) return text;
-  if (/official|官方/.test(text)) return "official";
-  if (/security|researcher|audit|安全|审计/.test(text)) return "security_researcher";
-  if (/media|news|媒体/.test(text)) return "media";
-  if (/kol|influencer/.test(text)) return "kol";
   return "unknown";
 }
 
@@ -38,17 +45,14 @@ function parseAmountUsd(value) {
   if (typeof value === "number") return Number.isFinite(value) && value >= 0 ? value : null;
 
   const text = cleanText(value).replace(/,/g, "");
-  if (!text || /unknown|未知|不明|n\/a/i.test(text)) return null;
-  const matched = text.match(/([0-9]+(?:\.[0-9]+)?)/);
+  if (!text || /^(unknown|未知|不明|n\/a)$/i.test(text)) return null;
+  const matched = text.match(/^(?:\$|USD\s*)?([0-9]+(?:\.[0-9]+)?)\s*(billion|bn|b|million|mn|m|百万|亿|万|thousand|k|千)?(?:\s*(?:USD|美元))?$/i);
   if (!matched) return null;
   const base = Number.parseFloat(matched[1]);
   if (!Number.isFinite(base) || base < 0) return null;
-  if (/亿/i.test(text)) return base * 100_000_000;
-  if (/\b(billion|bn)\b|[0-9](?:\.[0-9]+)?b\b/i.test(text)) return base * 1_000_000_000;
-  if (/\b(million|mn)\b|[0-9](?:\.[0-9]+)?m\b|百万/i.test(text)) return base * 1_000_000;
-  if (/万/i.test(text)) return base * 10_000;
-  if (/\bthousand\b|[0-9](?:\.[0-9]+)?k\b|千/i.test(text)) return base * 1_000;
-  return base;
+  const scale = { billion: 1e9, bn: 1e9, b: 1e9, million: 1e6, mn: 1e6, m: 1e6,
+    "百万": 1e6, "亿": 1e8, "万": 1e4, thousand: 1e3, k: 1e3, "千": 1e3 };
+  return base * (scale[(matched[2] || "").toLowerCase()] || 1);
 }
 
 function highestAlertLevel(a, b) {
@@ -101,12 +105,6 @@ function extractJson(raw) {
     }
     return { ok: false, error: "invalid_json" };
   }
-}
-
-function buildDedupKey(item) {
-  const source = cleanText(item.source_url).toLowerCase();
-  const raw = source || [item.project, item.incident_type, item.source_published_at].map((part) => cleanText(part).toLowerCase()).join("|");
-  return crypto.createHash("sha256").update(raw).digest("hex");
 }
 
 export function classifySecurityIncident(item, config = {}) {
@@ -164,7 +162,8 @@ export function parseXintelSecurityIncidents(raw, config = {}, now = new Date())
   if (!parsed.ok) return parsed;
 
   const root = parsed.value;
-  const rows = Array.isArray(root) ? root : root?.incidents || root?.security_incidents || root?.items || [];
+  if (root?.error || root?.ok === false || root?.success === false) return { ok: false, error: "invalid_shape" };
+  const rows = Array.isArray(root) ? root : root?.incidents ?? root?.security_incidents ?? root?.items;
   if (!Array.isArray(rows)) return { ok: false, error: "invalid_shape" };
 
   const intervalSec = clampInt(config.securityIncidentIntervalSec, 60, 3600, 1200);
@@ -179,8 +178,8 @@ export function parseXintelSecurityIncidents(raw, config = {}, now = new Date())
       continue;
     }
     const project = cleanText(row.project || row.project_name || row.protocol || row.exchange);
-    const incidentType = cleanText(row.incident_type || row.type || row.category || "other");
-    const sourcePublishedAt = cleanText(row.source_published_at || row.published_at || row.event_time || row.time);
+    const incidentType = cleanText(row.incident_type || row.type || row.category);
+    const sourcePublishedAt = cleanText(row.source_published_at || row.published_at);
     const sourceTs = Date.parse(sourcePublishedAt);
     if (!project || !incidentType) {
       addSkip(skipped, "missing_required_fields", row);
@@ -194,13 +193,17 @@ export function parseXintelSecurityIncidents(raw, config = {}, now = new Date())
       addSkip(skipped, "outside_lookback", row);
       continue;
     }
+    if (sourceTs > now.getTime() + 5 * 60 * 1000) {
+      addSkip(skipped, "future_source_published_at", row);
+      continue;
+    }
 
     const item = {
       project,
       incident_type: incidentType,
       amount_usd: parseAmountUsd(row.amount_usd ?? row.loss_usd ?? row.loss ?? row.amount),
       chain_platform: cleanText(row.chain_platform || row.chain || row.platform || row.exchange),
-      source_url: cleanText(row.source_url || row.url || row.link),
+      source_url: canonicalSourceUrl(row.source_url || row.url || row.link),
       source_user: cleanText(row.source_user || row.user || row.account),
       source_type: normalizeSourceType(row.source_type || row.sourceType),
       source_published_at: new Date(sourceTs).toISOString(),
@@ -216,10 +219,30 @@ export function parseXintelSecurityIncidents(raw, config = {}, now = new Date())
       addSkip(skipped, "low_confidence", row);
       continue;
     }
+    const amountInput = row.amount_usd ?? row.loss_usd ?? row.loss ?? row.amount;
+    if (amountInput !== null && amountInput !== undefined && amountInput !== "" && item.amount_usd === null &&
+      !(typeof amountInput === "string" && /^(unknown|未知|不明|n\/a)$/i.test(amountInput.trim()))) {
+      addSkip(skipped, "invalid_amount", row);
+      continue;
+    }
+    if (!incidentSchema.safeParse(item).success || !z.string().datetime({ offset: true }).safeParse(sourcePublishedAt).success) {
+      addSkip(skipped, "invalid_fields", row);
+      continue;
+    }
+    const post = xStatus(item.source_url);
+    if (post && item.source_user && item.source_user.replace(/^@/, "").toLowerCase() !== post.account) {
+      addSkip(skipped, "source_account_mismatch", row);
+      continue;
+    }
+    if (row.event_time && z.string().datetime({ offset: true }).safeParse(row.event_time).success && Date.parse(row.event_time) <= sourceTs) {
+      item.event_time = new Date(row.event_time).toISOString();
+    }
+    item.event_reference_url = canonicalSourceUrl(row.event_reference_url) || null;
     item.evidence_score = scoreSecurityIncidentEvidence(item);
     item.evidence_level = evidenceLevel(item.evidence_score);
     item.alert_level = classifySecurityIncident(item, config);
-    item.dedup_key = buildDedupKey(item);
+    item.event_identity = securityEventIdentity(item);
+    item.dedup_key = item.event_identity;
     item.raw_json = JSON.stringify(row);
     incidents.push(item);
   }
@@ -240,6 +263,7 @@ export function buildSecurityIncidentPrompt(config = {}) {
 - source_url 优先填 X 原帖或官方/安全机构帖子链接。
 - source_user 填发帖账号；source_type 填 official/security_researcher/media/kol/unknown。
 - source_published_at 必须填来源发布时间 UTC ISO；无法确认不要返回该条。
+- event_time 只填写原始事故发生时间，不是转载时间；无法确认填 null，不要估计。event_reference_url 填同一事故最初官方公告的链接，无法确认填 null。跨来源报道必须沿用同一事故时间或原始公告引用。
 - confidence 只用 high/medium/low；纯谣言不要返回。
 - summary 用简体中文，说明发生了什么和当前影响。
 
@@ -305,18 +329,19 @@ export class SecurityIncidentMonitor {
   }
 
   async processIncident(item) {
+    item = { ...item, dedup_key: this.db.resolveSecurityIncidentKey?.(item) || item.dedup_key };
     const existing = this.db.getSecurityIncidentByDedup?.(item.dedup_key) || null;
     const stored = this.db.upsertSecurityIncident?.(item) || null;
+    const amounts = [existing?.amount_usd, item.amount_usd, stored?.amount_usd].filter(Number.isFinite);
     const effective = {
       ...item,
       ...stored,
-      amount_usd: Math.max(
-        Number.isFinite(Number(existing?.amount_usd)) ? Number(existing.amount_usd) : 0,
-        Number.isFinite(Number(item.amount_usd)) ? Number(item.amount_usd) : 0,
-        Number.isFinite(Number(stored?.amount_usd)) ? Number(stored.amount_usd) : 0
-      ) || null,
+      amount_usd: amounts.length ? Math.max(...amounts) : null,
       alert_level: highestAlertLevel(existing?.alert_level || "watch", stored?.alert_level || item.alert_level)
     };
+    effective.evidence_score = Math.max(item.evidence_score || 0, existing?.evidence_score || 0, stored?.evidence_score || 0);
+    effective.alert_level = highestAlertLevel(effective.alert_level, classifySecurityIncident(effective, this.config));
+    this.db.setSecurityIncidentLevel?.(effective.dedup_key, effective.alert_level);
     effective.large_threshold = Number(this.config.securityIncidentLargeUsd || 5_000_000);
     if (!this.shouldPush(existing, effective)) {
       return { pushed: false, reason: effective.alert_level === "watch" ? "evidence_below_push_threshold" : "dedup_skip" };
@@ -331,7 +356,8 @@ export class SecurityIncidentMonitor {
     if (sendResult.ok) {
       this.db.markSecurityIncidentPushed?.(effective.dedup_key, effective.alert_level);
     }
-    return { pushed: sendResult.ok, reason: sendResult.status || sendResult.reason };
+    return { pushed: sendResult.ok, reason: sendResult.status || sendResult.reason,
+      ...(!sendResult.ok && sendResult.status !== "disabled" ? { delivery_failed: true } : {}) };
   }
 
   async runOnce(trigger = "timer") {
@@ -351,9 +377,11 @@ export class SecurityIncidentMonitor {
       }
 
       let pushed = 0;
+      let deliveryFailures = 0;
       const processSkipped = [];
       for (const item of parsed.incidents) {
         const result = await this.processIncident(item);
+        if (result.delivery_failed) deliveryFailures += 1;
         if (result.pushed) pushed += 1;
         else processSkipped.push({ reason: result.reason, project: item.project, source_url: item.source_url });
       }
@@ -361,9 +389,10 @@ export class SecurityIncidentMonitor {
       const skipCounts = countSkipReasons(skipped);
 
       this.lastFinishedAt = new Date().toISOString();
+      this.lastError = deliveryFailures ? `notification_delivery_failed_or_unknown:${deliveryFailures}` : "";
       this.db.recordHealth?.(
         "security_incident_monitor",
-        "ok",
+        deliveryFailures ? "warning" : "ok",
         `trigger=${trigger} incidents=${parsed.incidents.length} pushed=${pushed} skipped=${skipped.length} skip_reasons=${JSON.stringify(skipCounts)} duration_ms=${Date.now() - startedMs}`
       );
       logger.info("security_incident_monitor_done", {
@@ -374,7 +403,8 @@ export class SecurityIncidentMonitor {
         skip_reasons: skipCounts,
         duration_ms: Date.now() - startedMs
       });
-      return { ok: true, incidents: parsed.incidents.length, pushed, skipped: skipped.length, skip_reasons: skipCounts };
+      return { ok: deliveryFailures === 0, incidents: parsed.incidents.length, pushed, skipped: skipped.length, skip_reasons: skipCounts,
+        ...(deliveryFailures ? { error: this.lastError, delivery_failures: deliveryFailures } : {}) };
     } catch (error) {
       this.lastError = String(error.message || error);
       this.lastFinishedAt = new Date().toISOString();

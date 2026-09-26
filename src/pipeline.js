@@ -234,19 +234,19 @@ export class EnginePipeline {
       `采集范围：过去 ${this.config.opportunityLookbackHours || 24} 小时 | 打新 ${launchCount} | Pre-TGE ${preTgeCount}`
     ];
 
-    if (collectionResult?.ok === false) {
-      lines.push(`采集状态：异常（${compactLine(collectionResult.error || "未知错误", 120)}）`);
-    } else if (collectionResult?.partial) {
+    if (collectionResult?.partial) {
       lines.push("采集状态：部分查询成功，请以来源链接为准");
+    } else if (collectionResult?.ok !== true) {
+      lines.push(`采集状态：异常（${compactLine(collectionResult.error || collectionResult.reason || "结果未知", 120)}）`);
     } else {
       lines.push("采集状态：完成");
     }
 
     if (rows.length === 0) {
-      const emptyMessage = collectionResult?.ok === false
-        ? "采集失败，今日结果未知，不能据此判断没有新机会。"
-        : collectionResult?.partial
-          ? "已完成的查询未发现符合条件的新机会；未完成部分结果未知。"
+      const emptyMessage = collectionResult?.partial
+        ? "已完成的查询未发现符合条件的新机会；未完成部分结果未知。"
+        : collectionResult?.ok !== true
+          ? "采集失败，今日结果未知，不能据此判断没有新机会。"
           : "今日未发现符合条件且仍可参与的新机会。";
       lines.push("", emptyMessage);
       return lines.join("\n");
@@ -341,10 +341,19 @@ export class EnginePipeline {
 
       const startIso = beijingDayStartUtcIso(dateKey);
       const endIso = now.toISOString();
-      let collectionResult = { skipped: true, reason: "already_collected" };
-      if (!this.db.hasOpportunityRunSince?.(startIso, endIso)) {
+      const priorRun = this.db.getOpportunityRunSince?.(startIso, endIso);
+      if (this.opportunityMonitor.isRunning) return;
+      let collectionResult;
+      if (priorRun) {
+        collectionResult = { ok: priorRun.status === "ok", partial: priorRun.status === "partial",
+          run_id: priorRun.id, error: priorRun.error || (priorRun.status === "running" ? "previous_run_interrupted" : ""),
+          job_stats: priorRun.job_stats || [] };
+      } else if (!this.db.hasOpportunityRunSince?.(startIso, endIso)) {
         collectionResult = await this.opportunityMonitor.runOnce("daily_report");
+      } else {
+        collectionResult = { ok: false, error: "collection_status_unavailable" };
       }
+      if (collectionResult?.reason === "already_running") return;
 
       const collectionTypes = Array.isArray(this.config.opportunityCollectionTypes)
         ? this.config.opportunityCollectionTypes
@@ -389,12 +398,13 @@ export class EnginePipeline {
     if (result.status === "error") {
       blocks.push(`采集失败：${compactLine(result.error || "未知错误", 220)}`);
     } else if (recent.length === 0) {
-      blocks.push("今日无重大消息（近 2 天）");
+      blocks.push(result.status === "partial" ? "已完成部分未发现可核验重大消息；未覆盖或来源未核验部分结果未知。" : "今日无重大消息（近 2 天）");
     } else {
       blocks.push(`近 2 天重大消息：${recent.length} 条`);
     }
 
     const marketCapText = (value) => {
+      if (value === null || value === undefined || String(value).trim() === "") return "暂无可靠数据";
       const number = Number(value);
       if (!Number.isFinite(number)) return "暂无可靠数据";
       if (number >= 100000000) return `约 ${(number / 100000000).toFixed(2)} 亿美元`;
@@ -402,11 +412,13 @@ export class EnginePipeline {
       return `约 ${number.toFixed(0)} 美元`;
     };
     const changeText = (value) => {
+      if (value === null || value === undefined || String(value).trim() === "") return "暂无可靠数据";
       const number = Number(value);
       if (!Number.isFinite(number)) return "暂无可靠数据";
       return `${number >= 0 ? "+" : ""}${number.toFixed(2)}%`;
     };
     const priceText = (value) => {
+      if (value === null || value === undefined || String(value).trim() === "") return "暂无可靠数据";
       const number = Number(value);
       if (!Number.isFinite(number)) return "暂无可靠数据";
       if (number >= 1000) return `$${number.toFixed(2)}`;
@@ -418,6 +430,10 @@ export class EnginePipeline {
       `${index + 1}. ${item.token_name}/${item.symbol}`,
       `综合评分：${item.score}/10`,
       `消息核心内容：${item.summary_zh}`,
+      ...(item.category === "acquisition" ? [
+        `并购阶段：${({ signed: "已签约，尚未交割", completed: "已完成", terminated: "已终止" })[item.acquisition_status] || "未知"}`,
+        "注意：公司或资产并购不等于代币兑付、换币或持有人权益承诺，具体以官方披露为准。"
+      ] : []),
       `流通市值：${marketCapText(item.circulating_market_cap_usd)} | 当前价：${priceText(item.current_price_usd)} | 24h 涨跌幅：${changeText(item.price_change_percentage_24h)}`,
       `发布时间：${new Date(item.published_at).toLocaleString("zh-CN", { timeZone: BJ_TIMEZONE, hour12: false })}（北京时间）`,
       `来源账号：${item.source_account} | ${item.source_url}`
@@ -429,7 +445,7 @@ export class EnginePipeline {
       fallback.forEach((item, index) => blocks.push(formatItem(item, recent.length + index)));
     }
     if (result.status === "partial") {
-      const failed = (result.diagnostics || []).filter((item) => item.status === "error").length;
+      const failed = (result.diagnostics || []).filter((item) => item.status !== "ok").length;
       blocks.push(`注：${failed} 个检索批次异常，本期结果不代表完整覆盖。`);
     }
 
@@ -670,7 +686,7 @@ export class EnginePipeline {
       levelToPush = 2;
     }
 
-    if (!scoreResult.push_allowed && !degraded) {
+    if (!scoreResult.push_allowed) {
       this.db.insertPushLog({
         event_id: inserted.eventId,
         dedup_key: inserted.dedupKey,
@@ -778,43 +794,47 @@ export class EnginePipeline {
     }
   }
 
+  async runDailyTick(trigger) {
+    if (this.dailyTickRunning) return;
+    this.dailyTickRunning = true;
+    try {
+      await this.notifier.reconcilePending?.();
+      await this.resumePendingDailyReports();
+      const results = await Promise.allSettled([
+        this.maybeCollectBinanceMajorNewsDaily(trigger),
+        this.maybeSendBinanceMajorNewsDailyReport(trigger),
+        this.maybeSendOpportunityDailyReport(trigger),
+        this.maybeSendDailyReport(trigger)
+      ]);
+      for (const result of results) {
+        if (result.status === "rejected") logger.warn("daily_tick_failed", { error: String(result.reason?.message || result.reason) });
+      }
+    } catch (error) {
+      logger.warn("daily_tick_failed", { error: String(error?.message || error) });
+    } finally {
+      this.dailyTickRunning = false;
+    }
+  }
+
   async start() {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    await this.notifier.reconcilePending?.();
-    await this.resumePendingDailyReports();
+    this.securityIncidentMonitor.start();
+    if (this.config.opportunityScheduleMode === "interval") this.opportunityMonitor.start();
     const newsCycleEnabled = this.shouldRunNewsCycle();
-    if (newsCycleEnabled) {
-      await this.runCycle();
-    } else {
+    if (!newsCycleEnabled) {
       this.db.recordHealth("pipeline", "ok", "news_cycle_disabled");
       logger.info("news_cycle_disabled");
     }
-    await this.maybeCollectBinanceMajorNewsDaily("startup");
-    await this.maybeSendBinanceMajorNewsDailyReport("startup");
-    await this.maybeSendOpportunityDailyReport("startup");
-    await this.maybeSendDailyReport("startup");
-
     if (newsCycleEnabled) {
       this.timer = setInterval(() => {
         this.runCycle();
       }, this.config.pollIntervalSec * 1000);
     }
 
-    this.dailyReportTimer = setInterval(async () => {
-      await this.notifier.reconcilePending?.();
-      await this.resumePendingDailyReports();
-      await this.maybeCollectBinanceMajorNewsDaily("timer");
-      await this.maybeSendBinanceMajorNewsDailyReport("timer");
-      await this.maybeSendOpportunityDailyReport("timer");
-      await this.maybeSendDailyReport("timer");
-    }, Math.max(10, this.config.dailyReportCheckIntervalSec) * 1000);
-
-    if (this.config.opportunityScheduleMode === "interval") {
-      this.opportunityMonitor.start();
-    }
-    this.securityIncidentMonitor.start();
+    this.dailyReportTimer = setInterval(() => this.runDailyTick("timer"), Math.max(10, this.config.dailyReportCheckIntervalSec || 30) * 1000);
+    await Promise.allSettled([newsCycleEnabled ? this.runCycle() : null, this.runDailyTick("startup")]);
   }
 
   stop() {

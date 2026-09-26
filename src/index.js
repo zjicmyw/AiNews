@@ -20,8 +20,6 @@ async function main() {
     getSecurityIncidentStatus: () => pipeline.getSecurityIncidentStatus()
   });
 
-  await pipeline.start();
-
   const shutdown = (signal) => {
     logger.warn("shutdown_signal", { signal });
     pipeline.stop();
@@ -33,6 +31,7 @@ async function main() {
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+  await pipeline.start();
 }
 
 main().catch((error) => {

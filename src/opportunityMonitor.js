@@ -519,27 +519,28 @@ export class OpportunityMonitor {
     this.isRunning = true;
     this.lastStartedAt = new Date().toISOString();
     this.lastError = "";
-    const latestRun = this.db.getLatestOpportunityRun?.() || null;
-    const rotationOffset = Number(latestRun?.id || 0);
-    const currentItems = getCurrentOpportunityRows(this.db, this.config);
-    const queryContext = buildQueryAdaptations(this.config, latestRun);
-    const allPromptJobs = buildSearchPrompts(this.config, rotationOffset, currentItems, queryContext);
-    const requestedNames = new Set((options.onlyJobNames || []).map((value) => String(value || "").trim()).filter(Boolean));
-    const promptJobs = requestedNames.size
-      ? allPromptJobs.filter((job) => requestedNames.has(job.name))
-      : allPromptJobs;
-    if (requestedNames.size && promptJobs.length !== requestedNames.size) {
-      const available = new Set(allPromptJobs.map((job) => job.name));
-      const missing = [...requestedNames].filter((name) => !available.has(name));
-      return { skipped: true, reason: "requested_jobs_unavailable", missing };
-    }
-    const prompt = promptJobs.map((job) => `## ${job.name}\n${job.prompt}`).join("\n\n");
     const startedMs = Date.now();
-    const runId = this.db.startOpportunityRun?.({ startedAt: this.lastStartedAt, prompt });
+    let runId;
     let raw = "";
     let jobStats = [];
-
+    let quotaFailed = false;
     try {
+      const latestRun = this.db.getLatestOpportunityRun?.() || null;
+      const rotationOffset = Number(latestRun?.id || 0);
+      const currentItems = getCurrentOpportunityRows(this.db, this.config);
+      const queryContext = buildQueryAdaptations(this.config, latestRun);
+      const allPromptJobs = buildSearchPrompts(this.config, rotationOffset, currentItems, queryContext);
+      const requestedNames = new Set((options.onlyJobNames || []).map((value) => String(value || "").trim()).filter(Boolean));
+      const promptJobs = requestedNames.size
+        ? allPromptJobs.filter((job) => requestedNames.has(job.name))
+        : allPromptJobs;
+      if (requestedNames.size && promptJobs.length !== requestedNames.size) {
+        const available = new Set(allPromptJobs.map((job) => job.name));
+        const missing = [...requestedNames].filter((name) => !available.has(name));
+        return { skipped: true, reason: "requested_jobs_unavailable", missing };
+      }
+      const prompt = promptJobs.map((job) => `## ${job.name}\n${job.prompt}`).join("\n\n");
+      runId = this.db.startOpportunityRun?.({ startedAt: this.lastStartedAt, prompt });
       const candidates = [];
       const errors = [];
       const rawParts = [];
@@ -600,6 +601,7 @@ export class OpportunityMonitor {
             error: detail
           });
           if (isQuotaError(detail)) {
+            quotaFailed = true;
             const backoffSec = clampInt(this.config.opportunityQuotaErrorBackoffSec, 0, 7 * 86400, 43200);
             if (backoffSec > 0) {
               this.emptyResponsePausedUntil = new Date(Date.now() + backoffSec * 1000).toISOString();
@@ -616,7 +618,7 @@ export class OpportunityMonitor {
         throw new Error(errors.join("; "));
       }
 
-      const hydrated = await this.hydrateCandidates(candidates);
+      const hydrated = quotaFailed ? candidates : await this.hydrateCandidates(candidates);
       const { items: allNormalizedItems, report: normalizeReport } = normalizeOpportunityBatchWithReport(hydrated, new Date(), {
         lookbackHours: this.config.opportunityLookbackHours
       });
@@ -624,7 +626,7 @@ export class OpportunityMonitor {
       const normalizedItems = collectionTypes.length
         ? allNormalizedItems.filter((item) => collectionTypes.includes(item.type))
         : allNormalizedItems;
-      const items = await enrichOpportunities(normalizedItems, {
+      const items = quotaFailed ? normalizedItems : await enrichOpportunities(normalizedItems, {
         config: this.config,
         callHermes: this.callHermes.bind(this)
       });
@@ -632,12 +634,15 @@ export class OpportunityMonitor {
       for (const item of items) {
         this.db.upsertOpportunity?.(item);
       }
-      const existingEnriched = await this.enrichExistingOpportunities(new Set(items.map((item) => item.dedup_key)));
+      const existingEnriched = quotaFailed ? 0 : await this.enrichExistingOpportunities(new Set(items.map((item) => item.dedup_key)));
       this.db.markExpiredOpportunities?.(new Date().toISOString());
 
       const durationMs = Date.now() - startedMs;
-      this.emptyResponsePausedUntil = null;
-      this.pauseReason = "";
+      if (!quotaFailed) {
+        this.emptyResponsePausedUntil = null;
+        this.pauseReason = "";
+      }
+      this.lastError = errors.join("; ");
       this.db.finishOpportunityRun?.(runId, {
         status: errors.length ? "partial" : "ok",
         durationMs,

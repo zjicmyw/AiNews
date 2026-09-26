@@ -1,4 +1,5 @@
 import { extractJsonPayload } from "./opportunityUtils.js";
+import { fetchPublicPage, publicHttpsUrl } from "./publicPageFetch.js";
 
 const CEX_OFFICIAL_HOSTS = {
   Binance: ["binance.com"],
@@ -231,24 +232,8 @@ export function extractHtmlLinks(html, baseUrl) {
   return links;
 }
 
-function isPrivateHostname(hostname) {
-  const host = hostname.toLowerCase();
-  if (BLOCKED_HOSTS.has(host)) return true;
-  if (/^10\./.test(host)) return true;
-  if (/^192\.168\./.test(host)) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true;
-  if (/^169\.254\./.test(host)) return true;
-  return false;
-}
-
 export function isPublicHttpsUrl(value) {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:") return false;
-    return !isPrivateHostname(url.hostname);
-  } catch {
-    return false;
-  }
+  return publicHttpsUrl(value) && !BLOCKED_HOSTS.has(new URL(value).hostname);
 }
 
 function hostMatches(hostname, allowed) {
@@ -576,20 +561,29 @@ export function extractDeadlineFromText(text, now = new Date()) {
   };
 }
 
-export async function crawlOfficialPage(url, { fetchFn = globalThis.fetch, timeoutMs = 15000 } = {}) {
+export async function crawlOfficialPage(url, { fetchFn = fetchPublicPage, timeoutMs = 15000 } = {}) {
   if (!fetchFn) throw new Error("fetch_unavailable");
   if (!isPublicHttpsUrl(url)) throw new Error("invalid_public_https_url");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetchFn(url, {
+    let response;
+    for (let hop = 0; hop <= 5; hop += 1) {
+      if (!isPublicHttpsUrl(url)) throw new Error("invalid_public_https_url");
+      response = await fetchFn(url, {
       signal: controller.signal,
-      redirect: "follow",
+      redirect: "manual",
       headers: {
         "user-agent": "AiNews opportunity deadline verifier/1.0",
         accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5"
       }
-    });
+      });
+      if (response.url && new URL(response.url).href !== new URL(url).href) throw new Error("unexpected_redirect");
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      const location = response.headers?.get("location");
+      if (!location || hop === 5) throw new Error("official_redirect_limit");
+      url = new URL(location, url).href;
+    }
     if (!response.ok) throw new Error(`official_fetch_${response.status}`);
     const text = await response.text();
     const pageText = htmlToText(text);
@@ -749,7 +743,7 @@ export async function enrichOpportunities(items, options = {}) {
   const maxItems = Math.max(0, Number(config.opportunityEnrichmentMaxItems ?? 5));
   const grokFallbackMax = Math.max(0, Number(config.opportunityGrokDeadlineFallbackMax ?? 1));
   const timeoutMs = Math.max(1000, Number(config.opportunityOfficialCrawlTimeoutSec ?? 15) * 1000);
-  const fetchFn = options.fetchFn || globalThis.fetch;
+  const fetchFn = options.fetchFn || fetchPublicPage;
   const callHermes = options.callHermes;
   let enrichedCount = 0;
   let fallbackCount = 0;

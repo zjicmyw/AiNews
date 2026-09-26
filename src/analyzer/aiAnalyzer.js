@@ -335,7 +335,7 @@ export class AiAnalyzer {
 
   isAbusive403(errorMessage) {
     const text = String(errorMessage || "").toLowerCase();
-    return text.includes("http 403") && text.includes("abusive traffic patterns");
+    return text.includes("http 403");
   }
 
   shouldCallLlm(event, heuristicResult) {
