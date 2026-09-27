@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { logger } from "../logger.js";
 function fmtNum(value) {
   if (!Number.isFinite(value)) return "N/A";
   return value.toFixed(2);
@@ -132,19 +133,34 @@ export class TelegramNotifier {
       headers[this.config.telegramApiKeyHeader || "X-API-Key"] = this.config.telegramApiKey;
       headers["X-Idempotency-Key"] = idempotencyKey;
     }
-    const payload = mode === "relay" ? { chatId: targetChatId, message, idempotencyKey }
+    // Persist gateway acceptance first; the existing receipt tick confirms delivery.
+    // The relay's synchronous wait can exceed this client's submission deadline.
+    const payload = mode === "relay" ? { chatId: targetChatId, message, idempotencyKey, mode: "async" }
       : { chat_id: targetChatId, text: message, disable_web_page_preview: true };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), mode === "relay" ? 5000 : 12000);
     let result;
+    let httpStatus = null;
+    let jsonReceipt = false;
+    let transportFailure = null;
     try {
       const response = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(payload), signal: controller.signal, redirect: "error" });
-      const body = await response.json().catch(() => null);
+      httpStatus = response.status;
+      const body = await response.json().then((value) => { jsonReceipt = true; return value; }).catch(() => null);
       result = this.parseReceipt(body, response.ok, mode);
     } catch {
+      transportFailure = controller.signal.aborted ? "submission_timeout" : "transport_error";
       result = { status: "unknown", reason: "transport_outcome_unknown" };
     } finally {
       clearTimeout(timer);
+    }
+    if (!["queued", "sent", "suppressed"].includes(result.status)) {
+      // Preserve the original submission evidence before reconciliation updates its reason.
+      // Never include the endpoint, credentials, destination, body or raw transport error.
+      logger.warn("notification_submission_unconfirmed", {
+        businessId: identity, mode, status: result.status, reason: result.reason,
+        httpStatus, jsonReceipt, transportFailure
+      });
     }
     this.db?.updateNotificationDelivery?.(identity, result);
     const persisted = this.db?.getNotificationDelivery?.(identity);

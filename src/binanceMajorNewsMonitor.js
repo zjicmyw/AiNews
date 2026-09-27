@@ -1,4 +1,5 @@
 import { logger } from "./logger.js";
+import { isHermesQuotaError } from "./hermesClient.js";
 import fs from "node:fs";
 import { xStatus, canonicalSourceUrl } from "./sourceUrls.js";
 
@@ -258,13 +259,29 @@ JSON：
       catch { registry = {}; }
     }
     const universe = await this.getUniverse();
-    const allowedSymbols = new Set(universe);
     const batches = chunk(universe, Math.max(30, Math.min(120, Number(this.config.binanceMajorNewsChunkSize || 60))));
+    // Keep original batches as the coverage denominator. A paid call cannot
+    // establish affiliation, so admit only already verified symbols before it.
+    const verifiedBatches = batches.map((symbols) => symbols.filter((symbol) =>
+      Array.isArray(registry?.[symbol]) && registry[symbol].some((row) =>
+        row && SOURCE_ROLES.has(row.role) && typeof row.account === "string" && /^@?[a-z0-9_]{1,15}$/i.test(row.account) &&
+        verifiedSource({ symbol, source_account: `@${row.account.replace(/^@/, "")}`, source_role: row.role }, registry))));
     const items = [];
     const diagnostics = [];
     for (let index = 0; index < batches.length; index += 1) {
+      const verifiedSymbols = verifiedBatches[index];
+      const missingSources = batches[index].length - verifiedSymbols.length;
+      const allowedSymbols = new Set(verifiedSymbols);
+      if (!verifiedSymbols.length) {
+        diagnostics.push({ batch: index + 1, symbols: batches[index].length, status: "partial",
+          accepted: 0, unverified_sources: 0, searched_symbols: 0,
+          symbols_without_verified_sources: missingSources, error: "source_identity_unverified" });
+        logger.info("binance_major_news_batch_source_unverified", {
+          batch: index + 1, batches: batches.length, symbols: batches[index].length, searched_symbols: 0 });
+        continue;
+      }
       try {
-        const raw = await this.hermesClient.call(this.buildPrompt(batches[index], now.toISOString()));
+        const raw = await this.hermesClient.call(this.buildPrompt(verifiedSymbols, now.toISOString()));
         const parsed = extractJson(raw);
         if (!Array.isArray(parsed?.items) || parsed.error || parsed.ok === false || parsed.success === false) throw new Error("invalid_shape");
         const normalized = parsed.items
@@ -272,12 +289,9 @@ JSON：
           .filter(Boolean);
         const accepted = normalized.filter((item) => verifiedSource(item, registry));
         const unverified = normalized.length - accepted.length;
-        const missingSources = batches[index].filter((symbol) => !Array.isArray(registry?.[symbol]) ||
-          !registry[symbol].some((row) => row && SOURCE_ROLES.has(row.role) && /^@?[a-z0-9_]{1,15}$/i.test(row.account || "") &&
-            verifiedSource({ symbol, source_account: `@${row.account.replace(/^@/, "")}`, source_role: row.role }, registry))).length;
         items.push(...accepted);
         diagnostics.push({ batch: index + 1, symbols: batches[index].length, status: unverified || missingSources ? "partial" : "ok",
-          accepted: accepted.length, unverified_sources: unverified, symbols_without_verified_sources: missingSources,
+          accepted: accepted.length, unverified_sources: unverified, searched_symbols: verifiedSymbols.length, symbols_without_verified_sources: missingSources,
           ...(unverified || missingSources ? { error: "source_identity_unverified" } : {}) });
         logger.info("binance_major_news_batch_done", {
           batch: index + 1,
@@ -289,7 +303,7 @@ JSON：
         diagnostics.push({
           batch: index + 1,
           symbols: batches[index].length,
-          status: "error",
+          status: "error", searched_symbols: verifiedSymbols.length, symbols_without_verified_sources: missingSources,
           error: String(error?.message || error).slice(0, 180)
         });
         logger.warn("binance_major_news_batch_failed", {
@@ -297,6 +311,14 @@ JSON：
           batches: batches.length,
           error: String(error?.message || error)
         });
+        if (isHermesQuotaError(error)) {
+          for (let skipped = index + 1; skipped < batches.length; skipped++) {
+            diagnostics.push({ batch: skipped + 1, symbols: batches[skipped].length,
+              status: "skipped", error: "quota_backoff", accepted: 0, searched_symbols: 0,
+              symbols_without_verified_sources: batches[skipped].length - verifiedBatches[skipped].length });
+          }
+          break;
+        }
       }
     }
 
@@ -308,11 +330,11 @@ JSON：
       .slice(0, Math.max(1, Number(this.config.binanceMajorNewsMaxItems || 30)));
     const failures = diagnostics.filter((item) => item.status !== "ok");
     return {
-      status: failures.length === 0 ? "ok" : diagnostics.every((item) => item.status === "error") ? "error" : "partial",
+      status: failures.length === 0 ? "ok" : diagnostics.some((item) => ["ok", "partial"].includes(item.status)) ? "partial" : "error",
       universeCount: universe.length,
       items: deduped,
       diagnostics,
-      error: failures.map((item) => `batch_${item.batch}:${item.error}`).join("; ")
+      error: failures.filter((item) => item.status !== "skipped").map((item) => `batch_${item.batch}:${item.error}`).join("; ")
     };
   }
 }

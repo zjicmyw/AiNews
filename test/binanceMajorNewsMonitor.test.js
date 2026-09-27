@@ -193,3 +193,78 @@ test("buildPrompt includes substantive teaser discovery and per-token fallback",
   assert.match(prompt, /消息 -> 哪个经济变量变化/);
   assert.match(prompt, /同一事件只输出一次/);
 });
+
+
+const verifiedAccount = (overrides = {}) => ({ account: "@example", role: "project_official",
+  evidence_url: "https://example.org/team", verified_at: "2026-01-01T00:00:00Z", ...overrides });
+
+test("empty source registry skips all paid calls and keeps the full universe missing", async () => {
+  let calls = 0;
+  const monitor = new BinanceMajorNewsMonitor({ config: { binanceMajorNewsChunkSize: 60 }, sourceRegistry: {},
+    hermesClient: { call: async () => { calls++; throw Error("must not call paid provider"); } } });
+  monitor.getUniverse = async () => Array.from({ length: 480 }, (_, i) => `FIX${i}`);
+  const result = await monitor.run();
+  assert.equal(calls, 0);
+  assert.equal(result.universeCount, 480);
+  assert.equal(result.status, "partial");
+  assert.equal(result.diagnostics.length, 8);
+  assert.equal(result.diagnostics.reduce((n, d) => n + d.symbols_without_verified_sources, 0), 480);
+  assert.ok(result.diagnostics.every(d => d.error === "source_identity_unverified" && d.searched_symbols === 0));
+  assert.deepEqual(result.items, []);
+  const pipeline=Object.create(EnginePipeline.prototype);pipeline.config={};
+  const message=pipeline.buildBinanceMajorNewsMessages("2026-09-27",result).join("\n");
+  assert.match(message,/未执行付费搜索，重大消息结果未知/);
+  assert.doesNotMatch(message,/今日无重大消息|已完成部分未发现/);
+});
+
+test("invalid affiliation records cannot admit a paid request", async () => {
+  let calls = 0;
+  const symbols = ["ROLE", "FUTURE", "URL", "ACCOUNT", "NUMBER", "EMPTY"];
+  const sourceRegistry = {
+    ROLE: [verifiedAccount({role:"media"})],
+    FUTURE: [verifiedAccount({verified_at:new Date(Date.now()+86400000).toISOString()})],
+    URL: [verifiedAccount({evidence_url:"http://127.0.0.1/team"})],
+    ACCOUNT: [verifiedAccount({account:"@not-valid!"})], NUMBER: [verifiedAccount({account:123})], EMPTY: [],
+  };
+  const monitor = new BinanceMajorNewsMonitor({config:{},sourceRegistry,
+    hermesClient:{call:async()=>{calls++;return '{"items":[]}';}}});
+  monitor.getUniverse=async()=>symbols;
+  const result=await monitor.run();
+  assert.equal(calls,0);
+  assert.equal(result.diagnostics[0].symbols_without_verified_sources,6);
+});
+
+test("partial source coverage searches only verified batch symbols without shrinking denominator or accepting another batch", async () => {
+  const requested=[];let calls=0;
+  const sourceRegistry={ABC:[verifiedAccount()],BTC:[verifiedAccount()]};
+  const monitor=new BinanceMajorNewsMonitor({config:{binanceMajorNewsChunkSize:30},sourceRegistry,
+    hermesClient:{call:async()=>{
+      calls++;
+      return JSON.stringify({items: calls===1
+        ? [{...acquisitionFixture(),event_key:"abc-good"},{...acquisitionFixture(),symbol:"BTC",event_key:"cross-batch-1"}]
+        : [{...acquisitionFixture(),symbol:"BTC",event_key:"btc-good"},{...acquisitionFixture(),event_key:"cross-batch-2"}]});
+    }}});
+  monitor.getUniverse=async()=>["ABC",...Array.from({length:29},(_,i)=>`FIX${i}`),"BTC"];
+  const build=monitor.buildPrompt.bind(monitor);
+  monitor.buildPrompt=(symbols,now)=>{requested.push(symbols);return build(symbols,now);};
+  const result=await monitor.run();
+  assert.deepEqual(requested,[["ABC"],["BTC"]]);
+  assert.equal(calls,2);
+  assert.equal(result.universeCount,31);
+  assert.equal(result.status,"partial");
+  assert.equal(result.diagnostics[0].symbols,30);
+  assert.equal(result.diagnostics[0].searched_symbols,1);
+  assert.equal(result.diagnostics[0].symbols_without_verified_sources,29);
+  assert.equal(result.diagnostics[1].symbols,1);
+  assert.deepEqual(result.items.map(i=>i.event_key).sort(),["abc-good","btc-good"]);
+});
+
+test("admitted symbols still reject provider results from unregistered source accounts",async()=>{
+  const monitor=new BinanceMajorNewsMonitor({config:{},sourceRegistry:{ABC:[verifiedAccount()]},
+    hermesClient:{call:async()=>JSON.stringify({items:[{...acquisitionFixture(),source_account:"@outsider",source_url:"https://x.com/outsider/status/123"}]})}});
+  monitor.getUniverse=async()=>["ABC"];
+  const result=await monitor.run();
+  assert.equal(result.status,"partial");
+  assert.equal(result.diagnostics[0].unverified_sources,1);
+  assert.deepEqual(result.items,[]);
+});

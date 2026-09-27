@@ -162,7 +162,7 @@ test("A06: malformed collections fail, valid empty lists succeed", async () => {
   assert.equal(parseXintelOpportunities('{"opportunities":"invalid"}').ok, false);
   assert.equal(parseXintelSecurityIncidents('{"incidents":[]}').ok, true);
   assert.equal(parseXintelOpportunities('{"opportunities":[]}').ok, true);
-  const monitor = new BinanceMajorNewsMonitor({ config: {}, hermesClient: { call: async () => '{"error":"search failed"}' } });
+  const monitor = new BinanceMajorNewsMonitor({ config: {}, sourceRegistry: { BTC: [{ account: "@example", role: "project_official", evidence_url: "https://example.org/team", verified_at: "2026-01-01T00:00:00Z" }] }, hermesClient: { call: async () => '{"error":"search failed"}' } });
   monitor.getUniverse = async () => ["BTC"];
   assert.equal((await monitor.run()).status, "error");
 });
@@ -402,7 +402,9 @@ test("A17: official affiliation must be independently registered; unresolved ide
   const unknown = await monitor.run();
   assert.equal(unknown.status, "partial");
   assert.equal(unknown.items.length, 0);
-  assert.equal(unknown.diagnostics[0].unverified_sources, 1);
+  assert.equal(unknown.diagnostics[0].unverified_sources, 0);
+  assert.equal(unknown.diagnostics[0].searched_symbols, 0);
+  assert.equal(unknown.diagnostics[0].symbols_without_verified_sources, 1);
   monitor.sourceRegistry = { AUDIT: [{ account: "@example", role: "project_official",
     evidence_url: "https://example.org/team", verified_at: "2026-01-01T00:00:00Z" }] };
   const verified = await monitor.run();

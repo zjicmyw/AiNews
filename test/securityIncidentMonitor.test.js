@@ -376,6 +376,7 @@ test("TelegramNotifier relay send supports chatId override", async () => {
     assert.deepEqual(JSON.parse(requests[0].options.body), {
       chatId: "override-chat",
       message: "hello",
+      mode: "async",
       idempotencyKey: requests[0].options.headers["X-Idempotency-Key"]
     });
     assert.equal(result.status, "sent");

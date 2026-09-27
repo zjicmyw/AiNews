@@ -139,6 +139,8 @@ npm start
 ```
 
 ## 注意
+- 日志修复决定（2026-09-27，用户要求“根据日志优化和修复”）：针对 9 月 24-26 日额度耗尽后逐批重复失败、重启丢失退避和额度错误分类不明，新增 SQLite `hermes_quota_state`（按 Hermes 路径与 profile 隔离），以统一到期时间持久化退避；排队调用直接拒绝，不等待正常调用间隔，不滑动延长退避。重大消息只记录首个额度失败，剩余批次记为 skipped，已成功部分保留但不声称完整覆盖。`/status.json.hermes` 与机会 monitor 暴露 blocked/retry_after/persistence_error，run_health 保持失败但显示明确额度原因；退避到期仅表示可重试，不代表账户已恢复。替代 9 月 22 日“仅进程内退避”实现，不改变群组、计划时间、失败事实或 9 月 23 日停用安全专项监控的决定。验收覆盖持久化重开、到期、排队、部分采集、API 与文案；账户恢复和下一次自然日报回执仍分别核验，不额外调用模型或补发历史 unknown。
+- 本轮验证（2026-09-27 12:08 北京时间）：资源守卫全量测试 198/198 通过（回执 `20260927T120734-4e7ea338`），JS 语法与 diff 检查通过；SQLite 备份后部署至现有 `ai-news:3117`。线上 API 已将 run 358 归为 quota_exhausted，历史 status=error 不改写；新状态表已创建，安全 monitor 仍 disabled，无新增采集 run。机会日报 `opportunity:2026-09-26:part:1` 仍为 unknown，未重发；已有 Telegram async 修复保留并纳入全量测试。最新真实数据及下一次自然发送分别待验收，不影响本轮代码与部署结项。
 - 验收决定更新（2026-09-22，用户要求避免外部采集长期阻塞优化交付）：代码/回归、部署生效、真实采集、业务送达分别记录。对不改变数据采集与资金告警正确性的改动，可用受控 fixture 验收并交付；外部额度、历史补采或自然事件缺口单列，不拖住无关优化，也不将未验证填成通过。新错误或依赖恢复才重开相应验收，不为消除 Guardian 红灯将 error 改为 ok。本规则不宣称其他项目的 holder 数据已验收。
 - 2026-09-22 Guardian 事故 `INC-20260922-a713a48b-9fb5-446e-b943-a92e2009ba9c`：机会 run 354 的原始响应为 Grok `personal-team-blocked:spending-limit`。修复 Hermes stdout 额度错误被 stderr session ID 遮蔽的问题，并用共享客户端按现有 `OPPORTUNITY_QUOTA_ERROR_BACKOFF_SEC`（默认 12 小时）退避，后续排队任务在退避期间不启动子进程。退避状态在进程内，重启会重新尝试；不自动充值、切换供应商或重放当日日报。账户额度/订阅恢复后才能确认真实采集恢复，Guardian 最近失败记录保持真实。
 - 决定（2026-09-21，用户补充收购类消息重要）：重大新闻新增 `acquisition`，主动覆盖收购、被收购、合并、控制权变更、核心资产出售及并购终止，最高 9 分。官方确认的重大签约/完成/终止即使代币安排未知也收录，不再被价格催化门槛误滤；传闻、仅洽谈、旧闻、少数股权投资和普通合作不享受例外。日报展示交易阶段及代币权益提示，沿用原群组和时间，不新增实时推送或恢复线上服务。来源核验、新颖性及范围限制继续有效；合成测试不证明 NOM 的具体交易事实。
@@ -147,6 +149,8 @@ npm start
 - 市场确认使用接近一小时前的历史价格，不用日开盘价替代；仅取得备用现价、缺失小时历史或数据异常时继续 Fail-Closed。缺失行情显示“暂无可靠数据”，不转成零。
 - 重大新闻来源必须通过 `BINANCE_MAJOR_NEWS_SOURCES_FILE` 指向的本地核验表。默认 `config/project_x_sources.json` 为空，未核验消息不纳入，未覆盖项目计入 partial，不能据此宣称没有重大消息。该表由人工依据独立证据维护，模型不能写入或自行认证。
 - 核验表格式为 `{"SYMBOL":[{"account":"@verified_handle","role":"project_official","evidence_url":"https://project.example/team","verified_at":"2026-09-21T00:00:00Z"}]}`（仅格式示例，不能直接当作已核验来源）。角色允许 `project_official/founder/ceo/cto/cmo/core_team`；证据应能证明账号与该项目的关系，关系变动时更新表。
+
+- 决定（2026-09-27，本轮剩余问题处理）：重大消息在每批付费 Hermes 调用之前核验来源。整批无独立核验账号时，保持原 universe/批次分母，记录 `partial + source_identity_unverified`、`searched_symbols=0`，不调用模型；部分有来源时只搜索已核验 symbol，结果只能归入该批已检索 symbol，原来源校验仍执行。全批跳过的日报明确“来源尚未核验，本轮未执行付费搜索，重大消息结果未知”，不能写成今日无重大消息或健康。该修复减少无效费用，**不代表空来源表或 Grok 额度恢复**；保留原配额断路、async送达链及安全 monitor 停用状态，不新增账号/供应商/调度。本轮候选57项定向测试通过，文案窄改后20项对应回归通过；生产重启与自然业务验收单独记录在当前交付证据。18:15因来源为空跳过时不能用它证明账户恢复，额度恢复仍须下一次原本有资格的自然调用证据（例如19:04机会任务）。
 - 密钥只放 `.env`，不要提交到仓库。
 - GDELT 有速率限制，过快轮询会出现 429。
 - Massive/Finnhub 免费权限有限，系统已做主备容错和 Fail-Closed。
@@ -213,7 +217,10 @@ npm run pm2:startup
 - 多段日报在首段提交前冻结完整消息、目标和分段清单，仅保存在本地 SQLite 内部。崩溃或首段 unknown 后，现有 tick 先对账；确认原段 queued/sent 后，只首发尚无提交意图的剩余段，不重新采集/生成内容。明确发送失败仍需针对该业务 ID 修复。最终 sent/suppressed 不会被较晚的超时或查询结果覆盖。
 - 保留旧 `daily_reports.sent_at` 与推送标记，用于既有防重复与统计兼容；这些字段表示旧应用侧接受记录，不是网关最终回执。缺少关联回执的旧日报标为 `legacy_unverified`；最近 48 小时旧事件的应用推送标记若缺回执，也计入 legacy_event_unverified_count。均不修改历史记录，也不为补证据重发。
 - 持久化最终回执沿现有日报检查 tick 执行，每轮最多 5 条只读网关查询、单条最多 3 秒；只对最近 48 小时的 queued/unknown 意图对账。超过该窗口保留历史未知记录，不无限轮询。没有新增调度器。
+- 2026-09-27 交付修复：relay 提交显式采用 `mode=async`，避免客户端 5 秒提交超时先于网关同步等待完成；`queued` 后仍由原 tick 核对同键最终回执。首次提交未确认时仅记录业务 ID、HTTP 状态、固定错误分类和是否获得 JSON，不记录正文、目标、凭据或原始错误；后续对账不会抹掉日志中的原始提交证据。历史 unknown 不因此补发或改成 sent，真实验收沿下一次自然业务事件。
 - `health.status=healthy` 要求已启用日报最近应发业务均为最终 sent/suppressed，且当前事件窗口无失败、未知或排队。未出现待验收事件/尚在排队为 waiting；旧日报缺凭证、缺段、失败、未知或超出生成宽限为 warning。宽限仅用于区分等待和逾期：机会日报按已配置 Hermes 超时 × 最大查询数 + 300 秒（至少 600 秒），其他日报为 30 分钟；waiting 与 warning 均不证明送达。
 - 当前摘要只覆盖上述日期/48 小时窗口；超过 500 条的结果明确标 partial，不将截断当成全量健康。
 
 2026-09-08 决定：优先复用现有 TelegramBot `/message-status?taskId=` 与 `/message-receipt?idempotencyKey=` 及当前日报 tick；新增 `notification_delivery`、`notification_batches` 两张追加表，历史业务表保留。验收以同业务 ID 的最终回执和只读接口为准；未发生新真实业务事件时，不额外发送测试消息。
+
+2026-09-27 17:58:53 来源预检修复已定向加载到原 `ai-news` PM2 2，PID29678→8100；环境哈希保持、安全monitor仍false，重启前后Hermes active/queued均0，机会run358、重大消息run38、notification_batches38、notification_delivery48均未增加。57项源预检/配额定向回归、20项文案回归及最终3项账号类型边界通过。此项只完成节省调用修复，不代表来源表或账户恢复；不现场等18:15/19:04，沿用已有自然任务及回执跟进。证据：本工作流任务 `outputs/问题清单/evidence-20260927-all-closeout/ainews-source-preflight/`。

@@ -8,7 +8,7 @@ import { OpportunityMonitor } from "./opportunityMonitor.js";
 import { SecurityIncidentMonitor } from "./securityIncidentMonitor.js";
 import { BinanceMajorNewsMonitor } from "./binanceMajorNewsMonitor.js";
 import { BinanceMajorNewsMarketMetrics } from "./binanceMajorNewsMarketMetrics.js";
-import { HermesClient } from "./hermesClient.js";
+import { HermesClient, describeHermesError } from "./hermesClient.js";
 import { logger } from "./logger.js";
 import { readLines } from "./utils.js";
 import { isExcludedPreTgeTestnetOpportunity } from "./opportunityUtils.js";
@@ -75,7 +75,7 @@ export class EnginePipeline {
     this.marketModule = new MarketModule(config, tradingViewSignalStore);
     this.riskEngine = new RiskEngine(config, db);
     this.notifier = new TelegramNotifier(config, db);
-    this.hermesClient = new HermesClient(config);
+    this.hermesClient = new HermesClient(config, { stateStore: db });
     this.opportunityMonitor = new OpportunityMonitor({ config, db, hermesClient: this.hermesClient });
     this.binanceMajorNewsMonitor = new BinanceMajorNewsMonitor({ config, hermesClient: this.hermesClient });
     this.binanceMajorNewsMarketMetrics = new BinanceMajorNewsMarketMetrics({ config });
@@ -102,7 +102,7 @@ export class EnginePipeline {
   }
 
   getRuntimeStatus() {
-    return this.runtimeStatus;
+    return { ...this.runtimeStatus, hermes: this.hermesClient.getStatus() };
   }
 
   getOpportunityStatus() {
@@ -237,7 +237,7 @@ export class EnginePipeline {
     if (collectionResult?.partial) {
       lines.push("采集状态：部分查询成功，请以来源链接为准");
     } else if (collectionResult?.ok !== true) {
-      lines.push(`采集状态：异常（${compactLine(collectionResult.error || collectionResult.reason || "结果未知", 120)}）`);
+      lines.push(`采集状态：异常（${compactLine(describeHermesError(collectionResult.error || collectionResult.reason || "结果未知"), 120)}）`);
     } else {
       lines.push("采集状态：完成");
     }
@@ -396,9 +396,12 @@ export class EnginePipeline {
     const blocks = [];
 
     if (result.status === "error") {
-      blocks.push(`采集失败：${compactLine(result.error || "未知错误", 220)}`);
+      blocks.push(`采集失败：${compactLine(describeHermesError(result.error || "未知错误"), 220)}`);
     } else if (recent.length === 0) {
-      blocks.push(result.status === "partial" ? "已完成部分未发现可核验重大消息；未覆盖或来源未核验部分结果未知。" : "今日无重大消息（近 2 天）");
+      const noVerifiedSearch = result.status === "partial" && result.diagnostics?.length > 0
+        && result.diagnostics.every((batch) => batch.searched_symbols === 0 && batch.error === "source_identity_unverified");
+      blocks.push(noVerifiedSearch ? "来源尚未核验，本轮未执行付费搜索，重大消息结果未知。"
+        : result.status === "partial" ? "已完成部分未发现可核验重大消息；未覆盖或来源未核验部分结果未知。" : "今日无重大消息（近 2 天）");
     } else {
       blocks.push(`近 2 天重大消息：${recent.length} 条`);
     }

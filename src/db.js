@@ -29,6 +29,11 @@ export class DbClient {
 
   init() {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS hermes_quota_state (
+        client_key TEXT PRIMARY KEY,
+        blocked_until_ms INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS events (
         event_id TEXT PRIMARY KEY,
         dedup_key TEXT NOT NULL,
@@ -922,6 +927,16 @@ export class DbClient {
       )
       .get(startIso, endIso);
     return Boolean(row?.id);
+  }
+
+  getHermesQuotaState(clientKey) {
+    return this.db.prepare(`SELECT blocked_until_ms, updated_at FROM hermes_quota_state WHERE client_key=?`).get(clientKey);
+  }
+
+  setHermesQuotaState(clientKey, blockedUntilMs) {
+    this.db.prepare(`INSERT INTO hermes_quota_state (client_key, blocked_until_ms, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(client_key) DO UPDATE SET blocked_until_ms=excluded.blocked_until_ms, updated_at=excluded.updated_at`)
+      .run(clientKey, blockedUntilMs, new Date().toISOString());
   }
 
   getOpportunityRunSince(startIso, endIso = new Date().toISOString()) {

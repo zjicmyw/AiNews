@@ -1,4 +1,5 @@
 import { buildBusinessDeliveryEvidence } from "./businessDelivery.js";
+import { isHermesQuotaError, hermesQuotaRetryAt } from "./hermesClient.js";
 import express from "express";
 import { logger } from "./logger.js";
 import { buildCexCoverage } from "./opportunityAnalytics.js";
@@ -1580,6 +1581,12 @@ function parseRunIssue(rawIssue) {
   const [jobRaw, ...detailParts] = text.split(":");
   const job = detailParts.length ? jobRaw : "unknown";
   const detail = detailParts.length ? detailParts.join(":") : text;
+  if (isHermesQuotaError(detail)) {
+    const retryAt = hermesQuotaRetryAt(detail);
+    return { job, job_label: RUN_JOB_LABELS[job] || job, type: "quota_exhausted",
+      label: "Grok 额度或订阅权限不足", detail,
+      retry_after: retryAt === null ? null : new Date(retryAt).toISOString() };
+  }
   const timeoutMatch = detail.match(/hermes_timeout_after_(\d+)ms/i);
   if (timeoutMatch) {
     const seconds = Math.round(Number(timeoutMatch[1]) / 1000);
@@ -3911,6 +3918,7 @@ export function createHttpServer({
       risk_score: Number(latest.risk_score ?? runtime.risk_score ?? 0),
       market_confirmation: Number(latest.market_confirmation ?? runtime.market_confirmation ?? 0),
       latest_events: latestEvents,
+      ...(runtime.hermes ? { hermes: runtime.hermes } : {}),
       updated_at: runtime.updated_at || new Date().toISOString()
     });
   });

@@ -297,7 +297,7 @@ export class SecurityIncidentMonitor {
     this.config = config;
     this.db = db;
     this.notifier = notifier || new TelegramNotifier(config, db);
-    this.hermesClient = hermesClient || new HermesClient(config, { minIntervalMs: 0 });
+    this.hermesClient = hermesClient || new HermesClient(config, { minIntervalMs: 0, stateStore: db });
     this.isRunning = false;
     this.timer = null;
     this.nextRunAt = null;

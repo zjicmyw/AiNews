@@ -1,5 +1,5 @@
 ﻿import { logger } from "./logger.js";
-import { HermesClient } from "./hermesClient.js";
+import { HermesClient, isHermesQuotaError, hermesQuotaRetryAt } from "./hermesClient.js";
 import { buildCexCoverage } from "./opportunityAnalytics.js";
 import { enrichOpportunities } from "./opportunityEnrichment.js";
 import { normalizeOpportunityBatchWithReport, parseXintelOpportunities } from "./opportunityUtils.js";
@@ -253,7 +253,7 @@ function isAllEmptyResponseError(detail) {
 }
 
 function isQuotaError(detail) {
-  return /personal-team-blocked|spending-limit|run out of credits|need a grok subscription/i.test(String(detail || ""));
+  return isHermesQuotaError(detail);
 }
 
 function buildQueryAdaptations(config, latestRun) {
@@ -403,7 +403,7 @@ export class OpportunityMonitor {
   constructor({ config, db, hermesClient }) {
     this.config = config;
     this.db = db;
-    this.hermesClient = hermesClient || new HermesClient(config, { minIntervalMs: 0 });
+    this.hermesClient = hermesClient || new HermesClient(config, { minIntervalMs: 0, stateStore: db });
     this.isRunning = false;
     this.timer = null;
     this.nextRunAt = null;
@@ -415,16 +415,31 @@ export class OpportunityMonitor {
   }
 
   getStatus() {
-    const pausedUntil = this.emptyResponsePausedUntil;
+    const hermes = this.hermesClient.getStatus?.();
+    const pausedMs = Math.max(Date.parse(this.emptyResponsePausedUntil || "") || 0, Date.parse(hermes?.retry_after || "") || 0);
+    const pausedUntil = pausedMs > Date.now() ? new Date(pausedMs).toISOString() : null;
     return {
       enabled: Boolean(this.config.opportunityMonitorEnabled),
       running: this.isRunning,
       last_started_at: this.lastStartedAt,
       last_finished_at: this.lastFinishedAt,
-      next_run_at: pausedUntil || this.nextRunAt,
+      next_run_at: pausedUntil || (Date.parse(this.nextRunAt || "") > Date.now() ? this.nextRunAt : null),
       paused_until: pausedUntil,
-      last_error: this.lastError
+      last_error: this.lastError,
+      ...(hermes ? { hermes } : {})
     };
+  }
+
+  applyQuotaPause(error) {
+    const backoffSec = clampInt(this.config.opportunityQuotaErrorBackoffSec, 0, 7 * 86400, 43200);
+    // Reusing a shared block must not slide its expiry by another full backoff.
+    const retryAt = hermesQuotaRetryAt(error) ?? Date.parse(this.hermesClient.getStatus?.().retry_after || "");
+    const until = Number.isFinite(retryAt) ? retryAt : Date.now() + backoffSec * 1000;
+    if (until > Date.now()) {
+      this.emptyResponsePausedUntil = new Date(until).toISOString();
+      this.pauseReason = "xintel_quota_error_backoff";
+      this.nextRunAt = this.emptyResponsePausedUntil;
+    }
   }
 
   getQueryPlan() {
@@ -602,12 +617,7 @@ export class OpportunityMonitor {
           });
           if (isQuotaError(detail)) {
             quotaFailed = true;
-            const backoffSec = clampInt(this.config.opportunityQuotaErrorBackoffSec, 0, 7 * 86400, 43200);
-            if (backoffSec > 0) {
-              this.emptyResponsePausedUntil = new Date(Date.now() + backoffSec * 1000).toISOString();
-              this.pauseReason = "xintel_quota_error_backoff";
-              this.nextRunAt = this.emptyResponsePausedUntil;
-            }
+            this.applyQuotaPause(error);
             break;
           }
         }
@@ -675,12 +685,7 @@ export class OpportunityMonitor {
           this.nextRunAt = this.emptyResponsePausedUntil;
         }
       } else if (isQuotaError(detail)) {
-        const backoffSec = clampInt(this.config.opportunityQuotaErrorBackoffSec, 0, 7 * 86400, 43200);
-        if (backoffSec > 0) {
-          this.emptyResponsePausedUntil = new Date(Date.now() + backoffSec * 1000).toISOString();
-          this.pauseReason = "xintel_quota_error_backoff";
-          this.nextRunAt = this.emptyResponsePausedUntil;
-        }
+        this.applyQuotaPause(error);
       }
       this.db.finishOpportunityRun?.(runId, {
         status: "error",

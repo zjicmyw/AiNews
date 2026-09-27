@@ -8,6 +8,7 @@ import { TelegramNotifier } from '../src/notifier/telegram.js';
 import { buildBusinessDeliveryEvidence } from '../src/businessDelivery.js';
 import { EnginePipeline } from '../src/pipeline.js';
 import { createHttpServer } from '../src/httpServer.js';
+import { logger } from '../src/logger.js';
 
 const config = { telegramEnabled: true, telegramMode: 'relay', telegramServiceUrl: 'http://127.0.0.1:9',
   telegramApiKey: 'fixture-key', telegramChatId: 'fixture-chat', opportunityDailyReportEnabled: true,
@@ -31,7 +32,12 @@ const response = (body, status = 200) => new Response(JSON.stringify(body), { st
 test('relay acceptance is queued; duplicate business ID never posts again and final receipt persists', async (t) => {
   const db = fixture(t); let posts = 0;
   mockFetch(t, async (url, options) => {
-    if (options.method === 'POST') { posts++; return response({ success: true, status: 'queued', taskId: 'task-1' }, 202); }
+    if (options.method === 'POST') {
+      // A slow Telegram send must not keep submission waiting on gateway completion.
+      assert.equal(new URL(url).pathname, '/send-message');
+      assert.equal(JSON.parse(options.body).mode, 'async');
+      posts++; return response({ success: true, status: 'queued', taskId: 'task-1' }, 202);
+    }
     assert.equal(new URL(url).pathname, '/message-status');
     return response({ success: true, status: 'sent', taskId: 'task-1', messageId: 51, completedAt: '2026-09-08T11:04:03Z' });
   });
@@ -45,6 +51,37 @@ test('relay acceptance is queued; duplicate business ID never posts again and fi
   assert.equal(db.getNotificationDelivery('event-1').message_id, '51');
   await new TelegramNotifier(config, db).send({ message: 'fixture message', businessId: 'event-1' });
   assert.equal(posts, 1);
+});
+
+test('submission diagnostics survive later reconciliation without exposing secrets or message content', async (t) => {
+  const db = fixture(t); const logs = []; const originalWarn = logger.warn;
+  logger.warn = (event, detail) => logs.push({ event, ...detail });
+  t.after(() => { logger.warn = originalWarn; });
+  mockFetch(t, async (_url, options) => options.method === 'POST'
+    ? new Response('sensitive gateway body', { status: 429 }) : response({ success: false }, 404));
+  const notifier = new TelegramNotifier(config, db);
+  assert.equal((await notifier.send({ message: 'private message text', businessId: 'diagnostic' })).status, 'unknown');
+  age(db, 'diagnostic'); await notifier.reconcilePending();
+  assert.equal(db.getNotificationDelivery('diagnostic').reason, 'receipt_unavailable');
+  await notifier.send({ message: 'private message text', businessId: 'diagnostic' });
+  assert.deepEqual(logs, [{ event: 'notification_submission_unconfirmed', businessId: 'diagnostic',
+    mode: 'relay', status: 'unknown', reason: 'invalid_gateway_receipt', httpStatus: 429,
+    jsonReceipt: false, transportFailure: null }]);
+  for (const secret of ['fixture-key', 'fixture-chat', 'private message text', 'sensitive gateway body']) {
+    assert.equal(JSON.stringify(logs).includes(secret), false);
+  }
+});
+
+test('direct Telegram submission keeps its native payload and does not claim async acceptance', async (t) => {
+  const db = fixture(t);
+  mockFetch(t, async (_url, options) => {
+    const body = JSON.parse(options.body);
+    assert.equal(body.mode, undefined);
+    assert.equal(body.chat_id, 'fixture-chat');
+    return response({ ok: true, result: { message_id: 91 } });
+  });
+  const notifier = new TelegramNotifier({ ...config, telegramMode: 'direct', telegramBotToken: 'fixture-token' }, db);
+  assert.equal((await notifier.send({ message: 'direct fixture', businessId: 'direct' })).status, 'sent');
 });
 
 test('unknown transport keeps intent and reconciles by idempotency without replaying POST', async (t) => {
